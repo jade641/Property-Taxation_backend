@@ -1,0 +1,15 @@
+namespace PropertyTax.API.DTOs;
+
+public class PropertyDocumentDto
+{
+    public int Id { get; set; }
+    public int PropertyId { get; set; }
+    public string? PropertyPin { get; set; }
+    public string FileName { get; set; } = string.Empty;
+    public string OriginalFileName { get; set; } = string.Empty;
+    public string RelativePath { get; set; } = string.Empty;
+    public string ContentType { get; set; } = string.Empty;
+    public long SizeInBytes { get; set; }
+    public string Folder { get; set; } = "Property Documents";
+    public DateTime UploadedAtUtc { get; set; }
+}
