@@ -41,4 +41,13 @@
     <Content Update="Data\region-xi-locations.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Content Include="..\..\..\PropertyTax_ML\**\*"
+             Exclude="..\..\..\PropertyTax_ML\.venv\**\*;..\..\..\PropertyTax_ML\**\__pycache__\**\*;..\..\..\PropertyTax_ML\**\.ipynb_checkpoints\**\*;..\..\..\PropertyTax_ML\diagnostics\**\*">
+      <Link>PropertyTax_ML\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
+
 </Project>

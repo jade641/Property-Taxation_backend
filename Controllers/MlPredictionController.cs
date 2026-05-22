@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Net.Http;
+using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Authorization;
@@ -633,14 +634,14 @@ public class MlPredictionController : ControllerBase
             return Ok(cached);
         }
 
-        var mlServiceUrl = _configuration["MlServiceUrl"];
+        var mlServiceUrl = ResolveMlServiceBaseUrl();
         if (string.IsNullOrWhiteSpace(mlServiceUrl))
         {
             return StatusCode(503, new { error = "ML service unavailable" });
         }
 
         var client = _httpClientFactory.CreateClient(nameof(MlPredictionController));
-        client.BaseAddress = new Uri(mlServiceUrl.TrimEnd('/') + "/");
+        client.BaseAddress = new Uri(mlServiceUrl);
 
         HttpResponseMessage response;
         try
@@ -702,6 +703,131 @@ public class MlPredictionController : ControllerBase
         }
 
         return 0m;
+    }
+
+    private string? ResolveMlServiceBaseUrl()
+    {
+        var configuredUrl = _configuration["MlService:BaseUrl"]
+            ?? _configuration["MlServiceUrl"]
+            ?? Environment.GetEnvironmentVariable("ML_SERVICE_URL");
+
+        if (string.IsNullOrWhiteSpace(configuredUrl))
+        {
+            return null;
+        }
+
+        configuredUrl = configuredUrl.Trim();
+        if (!configuredUrl.EndsWith("/", StringComparison.Ordinal))
+        {
+            configuredUrl += "/";
+        }
+
+        return configuredUrl;
+    }
+
+    private sealed record RemoteModelMetrics(
+        string Name,
+        decimal Accuracy,
+        decimal Precision,
+        decimal Recall,
+        decimal F1Score,
+        decimal RocAuc);
+
+    private sealed record MlServiceTrainingResult(
+        bool Success,
+        string? BestModelName,
+        JsonElement Metrics,
+        string? ArtifactPath,
+        List<RemoteModelMetrics>? ModelMetrics);
+
+    private async Task<MlServiceTrainingResult> PostMlServiceTrainingAsync(string modelName, string datasetName, Dictionary<string, object>? parameters)
+    {
+        var mlServiceUrl = ResolveMlServiceBaseUrl();
+        if (string.IsNullOrWhiteSpace(mlServiceUrl))
+        {
+            throw new InvalidOperationException("ML service unavailable");
+        }
+
+        var client = _httpClientFactory.CreateClient(nameof(MlPredictionController));
+        client.BaseAddress = new Uri(mlServiceUrl);
+        client.Timeout = TimeSpan.FromMinutes(15);
+
+        var body = new
+        {
+            model = modelName,
+            dataset = datasetName,
+            parameters,
+        };
+
+        using var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+        HttpResponseMessage response;
+        try
+        {
+            response = await client.PostAsync("train", content);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException("Failed to reach ML service training endpoint.", ex);
+        }
+
+        var payload = await response.Content.ReadAsStringAsync();
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException($"ML service training request failed with status code {response.StatusCode}. Response: {payload}");
+        }
+
+        JsonDocument document;
+        try
+        {
+            document = JsonDocument.Parse(payload);
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidOperationException("ML service training endpoint returned invalid JSON.", ex);
+        }
+
+        var root = document.RootElement;
+        var success = root.TryGetProperty("success", out var successProp) && successProp.GetBoolean();
+        if (!success)
+        {
+            var error = root.TryGetProperty("error", out var errorProp) ? errorProp.GetString() : "Training failed.";
+            throw new InvalidOperationException(error);
+        }
+
+        var metrics = root.TryGetProperty("metrics", out var metricsProp) ? metricsProp : default;
+        var artifactPath = root.TryGetProperty("artifactPath", out var artifactPathProp) ? artifactPathProp.GetString() : null;
+        var bestModelName = root.TryGetProperty("bestModelName", out var bestModelNameProp)
+            ? bestModelNameProp.GetString()
+            : root.TryGetProperty("best_model_name", out var bestModelNameProp2)
+                ? bestModelNameProp2.GetString()
+                : null;
+        var modelMetrics = new List<RemoteModelMetrics>();
+
+        if (root.TryGetProperty("modelMetrics", out var modelMetricsProp) && modelMetricsProp.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in modelMetricsProp.EnumerateArray())
+            {
+                if (item.TryGetProperty("name", out var nameProp))
+                {
+                    var name = nameProp.GetString() ?? string.Empty;
+                    modelMetrics.Add(new RemoteModelMetrics(
+                        Name: name,
+                        Accuracy: item.TryGetProperty("accuracy", out var acc) && acc.TryGetDecimal(out var accValue) ? accValue : 0m,
+                        Precision: item.TryGetProperty("precision", out var prec) && prec.TryGetDecimal(out var precValue) ? precValue : 0m,
+                        Recall: item.TryGetProperty("recall", out var rec) && rec.TryGetDecimal(out var recValue) ? recValue : 0m,
+                        F1Score: item.TryGetProperty("f1Score", out var f1) && f1.TryGetDecimal(out var f1Value) ? f1Value : 0m,
+                        RocAuc: item.TryGetProperty("rocAuc", out var roc) && roc.TryGetDecimal(out var rocValue) ? rocValue : 0m
+                    ));
+                }
+            }
+        }
+
+        return new MlServiceTrainingResult(
+            Success: true,
+            BestModelName: bestModelName,
+            Metrics: metrics,
+            ArtifactPath: artifactPath,
+            ModelMetrics: modelMetrics.Count > 0 ? modelMetrics : null);
     }
 
     private bool TryBuildModelsFromArtifacts(out List<object> models)
@@ -922,6 +1048,26 @@ public class MlPredictionController : ControllerBase
 
     private string? FindMlDirectory()
     {
+        var configuredRoot = _configuration["PropertyTaxMlRoot"]
+            ?? _configuration["PROPERTYTAX_ML_ROOT"]
+            ?? _configuration["PROPERTYTAX_ML_DIR"];
+
+        if (!string.IsNullOrWhiteSpace(configuredRoot))
+        {
+            try
+            {
+                var configuredCandidate = Path.GetFullPath(configuredRoot);
+                if (Directory.Exists(configuredCandidate))
+                {
+                    return configuredCandidate;
+                }
+            }
+            catch
+            {
+                // Fall back to the normal search roots if the configured path is invalid.
+            }
+        }
+
         var searchRoots = new[]
         {
             _environment.ContentRootPath,
@@ -1126,59 +1272,82 @@ public class MlPredictionController : ControllerBase
                 job.Logs = $"{job.Logs}{Environment.NewLine}[{DateTime.UtcNow:O}] Training process spawned for {modelName} on dataset {datasetName}.";
                 await db.SaveChangesAsync();
 
-                var mlDir = FindMlDirectory();
-                if (string.IsNullOrWhiteSpace(mlDir))
-                {
-                    throw new DirectoryNotFoundException("PropertyTax_ML folder was not found.");
-                }
-
-                var pythonExe = Path.Combine(mlDir, ".venv", "Scripts", "python.exe");
-                if (!System.IO.File.Exists(pythonExe))
-                {
-                    pythonExe = "python";
-                }
-
-                var scriptPath = Path.Combine(mlDir, "train_and_evaluate.py");
-                if (!System.IO.File.Exists(scriptPath))
-                {
-                    throw new FileNotFoundException("train_and_evaluate.py script was not found.", scriptPath);
-                }
-
-                var startInfo = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = pythonExe,
-                    Arguments = $"\"{scriptPath}\" --model \"{modelName}\" --dataset \"{datasetName}\"",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                    WorkingDirectory = mlDir
-                };
-
-                using var process = new System.Diagnostics.Process();
-                process.StartInfo = startInfo;
-
                 job.Logs = $"{job.Logs}{Environment.NewLine}[{DateTime.UtcNow:O}] Running model fit and train-test split evaluation...";
                 await db.SaveChangesAsync();
 
-                process.Start();
+                string output;
+                string error = string.Empty;
 
-                var outputTask = process.StandardOutput.ReadToEndAsync();
-                var errorTask = process.StandardError.ReadToEndAsync();
-
-                var completed = process.WaitForExit(600000);
-                if (!completed)
+                var mlServiceUrl = ResolveMlServiceBaseUrl();
+                if (!string.IsNullOrWhiteSpace(mlServiceUrl))
                 {
-                    process.Kill();
-                    throw new TimeoutException("Training process timed out after 10 minutes.");
+                    job.Logs = $"{job.Logs}{Environment.NewLine}[{DateTime.UtcNow:O}] Sending training request to ML service...";
+                    await db.SaveChangesAsync();
+
+                    var trainingResult = await PostMlServiceTrainingAsync(modelName, datasetName, null);
+
+                    output = JsonSerializer.Serialize(new
+                    {
+                        success = true,
+                        metrics = trainingResult.Metrics,
+                        artifactPath = trainingResult.ArtifactPath,
+                        best_model_name = trainingResult.BestModelName,
+                        modelMetrics = trainingResult.ModelMetrics,
+                    });
                 }
-
-                var output = await outputTask;
-                var error = await errorTask;
-
-                if (process.ExitCode != 0)
+                else
                 {
-                    throw new Exception($"Training process failed with exit code {process.ExitCode}.{Environment.NewLine}Error: {error}");
+                    var mlDir = FindMlDirectory();
+                    if (string.IsNullOrWhiteSpace(mlDir))
+                    {
+                        throw new DirectoryNotFoundException("PropertyTax_ML folder was not found.");
+                    }
+
+                    var pythonExe = Path.Combine(mlDir, ".venv", "Scripts", "python.exe");
+                    if (!System.IO.File.Exists(pythonExe))
+                    {
+                        pythonExe = "python";
+                    }
+
+                    var scriptPath = Path.Combine(mlDir, "train_and_evaluate.py");
+                    if (!System.IO.File.Exists(scriptPath))
+                    {
+                        throw new FileNotFoundException("train_and_evaluate.py script was not found.", scriptPath);
+                    }
+
+                    var startInfo = new System.Diagnostics.ProcessStartInfo
+                    {
+                        FileName = pythonExe,
+                        Arguments = $"\"{scriptPath}\" --model \"{modelName}\" --dataset \"{datasetName}\"",
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true,
+                        WorkingDirectory = mlDir
+                    };
+
+                    using var process = new System.Diagnostics.Process();
+                    process.StartInfo = startInfo;
+
+                    process.Start();
+
+                    var outputTask = process.StandardOutput.ReadToEndAsync();
+                    var errorTask = process.StandardError.ReadToEndAsync();
+
+                    var completed = process.WaitForExit(600000);
+                    if (!completed)
+                    {
+                        process.Kill();
+                        throw new TimeoutException("Training process timed out after 10 minutes.");
+                    }
+
+                    output = await outputTask;
+                    error = await errorTask;
+
+                    if (process.ExitCode != 0)
+                    {
+                        throw new Exception($"Training process failed with exit code {process.ExitCode}.{Environment.NewLine}Error: {error}");
+                    }
                 }
 
                 using var doc = JsonDocument.Parse(output);
@@ -1186,80 +1355,154 @@ public class MlPredictionController : ControllerBase
 
                 if (root.TryGetProperty("success", out var successProp) && successProp.GetBoolean())
                 {
-                    var metricsElement = root.GetProperty("metrics");
-                    var artifactPath = root.GetProperty("artifactPath").GetString();
+                    JsonElement metricsElement = default;
+                    if (root.TryGetProperty("metrics", out var metricsProp))
+                    {
+                        metricsElement = metricsProp;
+                    }
+
+                    var artifactPath = root.TryGetProperty("artifactPath", out var artifactPathProp)
+                        ? artifactPathProp.GetString()
+                        : null;
 
                     if (job.Model is not null)
                     {
-                        job.Model.MetricsJson = metricsElement.GetRawText();
+                        job.Model.MetricsJson = metricsElement.ValueKind != JsonValueKind.Undefined
+                            ? metricsElement.GetRawText()
+                            : "{}";
                         job.Model.ArtifactPath = artifactPath ?? string.Empty;
                         job.Model.CreatedAt = DateTime.UtcNow;
                     }
 
-                    // Promote the retrained model to active, deactivate all others
+                    var bestModelName = root.TryGetProperty("best_model_name", out var bestModelNameProp)
+                        ? bestModelNameProp.GetString()
+                        : root.TryGetProperty("bestModelName", out var bestModelNameProp2)
+                            ? bestModelNameProp2.GetString()
+                            : null;
+
+                    // Promote the retrained model to active, deactivate all others.
+                    // Prefer the best model name from the ML service if provided.
                     var allModels = await db.MlModels.ToListAsync();
                     foreach (var m in allModels)
-                        m.IsActive = m.Id == job.ModelId;
+                    {
+                        if (!string.IsNullOrWhiteSpace(bestModelName))
+                        {
+                            m.IsActive = string.Equals(m.Name, bestModelName, StringComparison.OrdinalIgnoreCase);
+                        }
+                        else
+                        {
+                            m.IsActive = m.Id == job.ModelId;
+                        }
+                    }
 
                     job.Status = "Completed";
                     job.FinishedAt = DateTime.UtcNow;
                     job.Logs = $"{job.Logs}{Environment.NewLine}[{DateTime.UtcNow:O}] Training completed successfully! Real computed evaluation metrics stored.";
                     await db.SaveChangesAsync();
 
-                    // After job.Status = "Completed", update per-model metrics from CSV
-                    var csvPath = FindMlArtifactPath("propertytax_model_selection_results.csv");
-                    if (csvPath is not null)
+                    if (root.TryGetProperty("modelMetrics", out var modelMetricsElement) && modelMetricsElement.ValueKind == JsonValueKind.Array)
                     {
-                        var csvLines = System.IO.File.ReadAllLines(csvPath)
-                            .Where(l => !string.IsNullOrWhiteSpace(l)).ToArray();
-                        if (csvLines.Length >= 2)
+                        foreach (var item in modelMetricsElement.EnumerateArray())
                         {
-                            var headers = ParseCsvLine(csvLines[0])
-                                .Select(h => h.Trim().ToLowerInvariant()).ToArray();
-                            var modelIdx = Array.IndexOf(headers, "model");
-                            var accIdx = Array.IndexOf(headers, "test_accuracy");
-                            var precIdx = Array.IndexOf(headers, "test_precision");
-                            var recIdx = Array.IndexOf(headers, "test_recall");
-                            var f1Idx = Array.IndexOf(headers, "test_f1");
-                            var rocIdx = Array.IndexOf(headers, "test_roc_auc");
-
-                            foreach (var line in csvLines.Skip(1))
+                            if (!item.TryGetProperty("name", out var nameProp))
                             {
-                                var cols = ParseCsvLine(line);
-                                if (modelIdx < 0 || modelIdx >= cols.Count) continue;
-                                var csvModelName = cols[modelIdx].Trim();
-                                if (string.IsNullOrWhiteSpace(csvModelName)) continue;
-
-                                var dbModel = await db.MlModels
-                                    .FirstOrDefaultAsync(m => m.Name.ToLower() == csvModelName.ToLower());
-
-                                // Create a new DB entry if the model doesn't exist yet
-                                if (dbModel is null)
-                                {
-                                    dbModel = new MlModel
-                                    {
-                                        Name = csvModelName,
-                                        Version = "v1.0",
-                                        MetricsJson = "{}",
-                                        ArtifactPath = string.Empty,
-                                        IsActive = false,
-                                        CreatedAt = DateTime.UtcNow,
-                                    };
-                                    db.MlModels.Add(dbModel);
-                                    await db.SaveChangesAsync();
-                                }
-
-                                dbModel.MetricsJson = System.Text.Json.JsonSerializer.Serialize(new
-                                {
-                                    accuracy = ReadDecimal(cols, accIdx),
-                                    precision = ReadDecimal(cols, precIdx),
-                                    recall = ReadDecimal(cols, recIdx),
-                                    f1Score = ReadDecimal(cols, f1Idx),
-                                    rocAuc = ReadDecimal(cols, rocIdx),
-                                });
-                                dbModel.CreatedAt = DateTime.UtcNow;
+                                continue;
                             }
-                            await db.SaveChangesAsync();
+
+                            var csvModelName = nameProp.GetString()?.Trim();
+                            if (string.IsNullOrWhiteSpace(csvModelName))
+                            {
+                                continue;
+                            }
+
+                            var dbModel = await db.MlModels
+                                .FirstOrDefaultAsync(m => m.Name.ToLower() == csvModelName.ToLower());
+
+                            if (dbModel is null)
+                            {
+                                dbModel = new MlModel
+                                {
+                                    Name = csvModelName,
+                                    Version = "v1.0",
+                                    MetricsJson = "{}",
+                                    ArtifactPath = string.Empty,
+                                    IsActive = false,
+                                    CreatedAt = DateTime.UtcNow,
+                                };
+                                db.MlModels.Add(dbModel);
+                                await db.SaveChangesAsync();
+                            }
+
+                            dbModel.MetricsJson = System.Text.Json.JsonSerializer.Serialize(new
+                            {
+                                accuracy = item.TryGetProperty("accuracy", out var accProp) && accProp.TryGetDecimal(out var accValue) ? accValue : 0m,
+                                precision = item.TryGetProperty("precision", out var precProp) && precProp.TryGetDecimal(out var precValue) ? precValue : 0m,
+                                recall = item.TryGetProperty("recall", out var recallProp) && recallProp.TryGetDecimal(out var recallValue) ? recallValue : 0m,
+                                f1Score = item.TryGetProperty("f1Score", out var f1Prop) && f1Prop.TryGetDecimal(out var f1Value) ? f1Value : 0m,
+                                rocAuc = item.TryGetProperty("rocAuc", out var rocProp) && rocProp.TryGetDecimal(out var rocValue) ? rocValue : 0m,
+                            });
+                            dbModel.CreatedAt = DateTime.UtcNow;
+                        }
+
+                        await db.SaveChangesAsync();
+                    }
+                    else
+                    {
+                        // After job.Status = "Completed", update per-model metrics from CSV when remote metrics are unavailable.
+                        var csvPath = FindMlArtifactPath("propertytax_model_selection_results.csv");
+                        if (csvPath is not null)
+                        {
+                            var csvLines = System.IO.File.ReadAllLines(csvPath)
+                                .Where(l => !string.IsNullOrWhiteSpace(l)).ToArray();
+                            if (csvLines.Length >= 2)
+                            {
+                                var headers = ParseCsvLine(csvLines[0])
+                                    .Select(h => h.Trim().ToLowerInvariant()).ToArray();
+                                var modelIdx = Array.IndexOf(headers, "model");
+                                var accIdx = Array.IndexOf(headers, "test_accuracy");
+                                var precIdx = Array.IndexOf(headers, "test_precision");
+                                var recIdx = Array.IndexOf(headers, "test_recall");
+                                var f1Idx = Array.IndexOf(headers, "test_f1");
+                                var rocIdx = Array.IndexOf(headers, "test_roc_auc");
+
+                                foreach (var line in csvLines.Skip(1))
+                                {
+                                    var cols = ParseCsvLine(line);
+                                    if (modelIdx < 0 || modelIdx >= cols.Count) continue;
+                                    var csvModelName = cols[modelIdx].Trim();
+                                    if (string.IsNullOrWhiteSpace(csvModelName)) continue;
+
+                                    var dbModel = await db.MlModels
+                                        .FirstOrDefaultAsync(m => m.Name.ToLower() == csvModelName.ToLower());
+
+                                    // Create a new DB entry if the model doesn't exist yet
+                                    if (dbModel is null)
+                                    {
+                                        dbModel = new MlModel
+                                        {
+                                            Name = csvModelName,
+                                            Version = "v1.0",
+                                            MetricsJson = "{}",
+                                            ArtifactPath = string.Empty,
+                                            IsActive = false,
+                                            CreatedAt = DateTime.UtcNow,
+                                        };
+                                        db.MlModels.Add(dbModel);
+                                        await db.SaveChangesAsync();
+                                    }
+
+                                    dbModel.MetricsJson = System.Text.Json.JsonSerializer.Serialize(new
+                                    {
+                                        accuracy = ReadDecimal(cols, accIdx),
+                                        precision = ReadDecimal(cols, precIdx),
+                                        recall = ReadDecimal(cols, recIdx),
+                                        f1Score = ReadDecimal(cols, f1Idx),
+                                        rocAuc = ReadDecimal(cols, rocIdx),
+                                    });
+                                    dbModel.CreatedAt = DateTime.UtcNow;
+                                }
+                                await db.SaveChangesAsync();
+                            }
                         }
                     }
 
