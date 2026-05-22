@@ -161,7 +161,7 @@ if (corsOrigins.Length > 0 || allowAnyOrigin)
             }
             else
             {
-                policy.WithOrigins(corsOrigins)
+                policy.SetIsOriginAllowed(origin => IsAllowedFrontendOrigin(origin, corsOrigins))
                     .WithHeaders("Authorization", "Content-Type", "Accept")
                     .WithMethods("GET", "POST", "PUT", "DELETE", "OPTIONS");
             }
@@ -520,6 +520,35 @@ static string[] ResolveCorsOrigins(IConfiguration configuration, string? fallbac
     }
 
     return [];
+}
+
+static bool IsAllowedFrontendOrigin(string origin, string[] configuredOrigins)
+{
+    if (!Uri.TryCreate(origin, UriKind.Absolute, out var parsedOrigin))
+    {
+        return false;
+    }
+
+    var normalizedOrigin = origin.TrimEnd('/');
+
+    if (configuredOrigins.Any(configured => string.Equals(configured, normalizedOrigin, StringComparison.OrdinalIgnoreCase)))
+    {
+        return true;
+    }
+
+    if (!string.Equals(parsedOrigin.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+        && !string.Equals(parsedOrigin.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase))
+    {
+        return false;
+    }
+
+    var host = parsedOrigin.Host;
+
+    return host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+        || host.Equals("127.0.0.1", StringComparison.OrdinalIgnoreCase)
+        || host.Equals("::1", StringComparison.OrdinalIgnoreCase)
+        || host.Equals("vercel.app", StringComparison.OrdinalIgnoreCase)
+        || host.EndsWith(".vercel.app", StringComparison.OrdinalIgnoreCase);
 }
 
 static string ResolveUploadRootPath(string contentRootPath, string? configuredUploadRoot)
