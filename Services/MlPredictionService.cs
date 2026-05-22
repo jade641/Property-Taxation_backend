@@ -7,6 +7,7 @@ using System.Text.Json;
 using System.Threading;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using PropertyTax.API.Data;
 using PropertyTax.API.Models;
@@ -18,13 +19,15 @@ public class MlPredictionService : IMlPredictionService
     private readonly AppDbContext _db;
     private readonly IHttpClientFactory _httpFactory;
     private readonly IConfiguration _config;
+    private readonly IHostEnvironment _environment;
     private readonly ILogger<MlPredictionService> _logger;
 
-    public MlPredictionService(AppDbContext db, IHttpClientFactory httpFactory, IConfiguration config, ILogger<MlPredictionService> logger)
+    public MlPredictionService(AppDbContext db, IHttpClientFactory httpFactory, IConfiguration config, IHostEnvironment environment, ILogger<MlPredictionService> logger)
     {
         _db = db;
         _httpFactory = httpFactory;
         _config = config;
+        _environment = environment;
         _logger = logger;
     }
 
@@ -221,7 +224,11 @@ public class MlPredictionService : IMlPredictionService
         }
 
         // Call ML microservice
-        var mlBase = _config.GetValue<string>("MlService:BaseUrl") ?? "http://localhost:8000";
+        var mlBase = _config["MlService:BaseUrl"]
+            ?? _config["MlServiceUrl"]
+            ?? Environment.GetEnvironmentVariable("ML_SERVICE_URL")
+            ?? (_environment.IsDevelopment() ? "http://localhost:8000" : null)
+            ?? throw new InvalidOperationException("ML service base URL is not configured.");
         var timeoutSecs = _config.GetValue<int?>("MlService:TimeoutSeconds") ?? 10;
         var retries = _config.GetValue<int?>("MlService:RetryCount") ?? 2;
 
@@ -259,9 +266,9 @@ public class MlPredictionService : IMlPredictionService
                 using var doc = JsonDocument.Parse(content);
                 var root = doc.RootElement;
 
-                var probability = root.GetProperty("probability").GetDouble();
-                var predictedLabel = root.GetProperty("predictedLabel").GetInt32();
-                var riskLevel = root.GetProperty("riskLevel").GetString() ?? "Unknown";
+                var predictedLabel = ReadPredictionLabel(root);
+                var probability = ReadProbability(root, predictedLabel);
+                var riskLevel = ReadRiskLevel(root, probability, predictedLabel);
 
                 resultPrediction.Probability = (decimal)probability;
                 resultPrediction.PredictedLabel = predictedLabel != 0;
@@ -316,5 +323,89 @@ public class MlPredictionService : IMlPredictionService
         _db.MlPredictions.Add(resultPrediction);
         await _db.SaveChangesAsync();
         return resultPrediction;
+    }
+
+    private static int ReadPredictionLabel(JsonElement root)
+    {
+        if (TryGetInt32(root, "prediction", out var prediction))
+        {
+            return prediction;
+        }
+
+        if (TryGetInt32(root, "predictedLabel", out prediction))
+        {
+            return prediction;
+        }
+
+        return 0;
+    }
+
+    private static double ReadProbability(JsonElement root, int predictedLabel)
+    {
+        if (TryGetDouble(root, "probability", out var probability))
+        {
+            if (probability > 1.0)
+            {
+                probability /= 100.0;
+            }
+
+            return Math.Clamp(probability, 0.0, 1.0);
+        }
+
+        return predictedLabel != 0 ? 1.0 : 0.0;
+    }
+
+    private static string ReadRiskLevel(JsonElement root, double probability, int predictedLabel)
+    {
+        if (TryGetString(root, "riskLevel", out var riskLevel) && !string.IsNullOrWhiteSpace(riskLevel))
+        {
+            return riskLevel;
+        }
+
+        if (probability >= 0.75 || predictedLabel != 0)
+        {
+            return "High";
+        }
+
+        if (probability >= 0.4)
+        {
+            return "Medium";
+        }
+
+        return "Low";
+    }
+
+    private static bool TryGetDouble(JsonElement root, string propertyName, out double value)
+    {
+        value = default;
+        if (root.TryGetProperty(propertyName, out var element) && element.ValueKind == JsonValueKind.Number)
+        {
+            return element.TryGetDouble(out value);
+        }
+
+        return false;
+    }
+
+    private static bool TryGetInt32(JsonElement root, string propertyName, out int value)
+    {
+        value = default;
+        if (root.TryGetProperty(propertyName, out var element) && element.ValueKind == JsonValueKind.Number)
+        {
+            return element.TryGetInt32(out value);
+        }
+
+        return false;
+    }
+
+    private static bool TryGetString(JsonElement root, string propertyName, out string? value)
+    {
+        value = default;
+        if (root.TryGetProperty(propertyName, out var element) && element.ValueKind == JsonValueKind.String)
+        {
+            value = element.GetString();
+            return true;
+        }
+
+        return false;
     }
 }

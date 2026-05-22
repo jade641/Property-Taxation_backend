@@ -206,10 +206,16 @@ public class MlPredictionController : ControllerBase
     [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant + "," + SystemRoles.Staff)]
     public async Task<IActionResult> GetModels()
     {
-        if (TryBuildModelsFromArtifacts(out var artifactModels))
+        var result = TryBuildModelsFromArtifacts(out var artifactModels);
+        _logger.LogInformation("TryBuildModelsFromArtifacts returned: {Result}, model count: {Count}", result, artifactModels.Count);
+
+        if (result)
         {
+            _logger.LogInformation("Serving {Count} models from artifacts", artifactModels.Count);
             return Ok(ApiResponse<object>.Ok(artifactModels));
         }
+
+        _logger.LogWarning("TryBuildModelsFromArtifacts returned false, falling back to database");
 
         var models = await _db.MlModels
             .AsNoTracking()
@@ -241,6 +247,29 @@ public class MlPredictionController : ControllerBase
         return Ok(ApiResponse<object>.Ok(items));
     }
 
+    [HttpDelete("models/cleanup")]
+    [Authorize(Roles = SystemRoles.Admin)]
+    public async Task<IActionResult> CleanupDuplicateModels()
+    {
+        // Keep only the most recent model per name, delete others with empty metrics
+        var allModels = await _db.MlModels.OrderByDescending(m => m.CreatedAt).ToListAsync();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var toDelete = new List<MlModel>();
+
+        foreach (var model in allModels)
+        {
+            var isEmpty = string.IsNullOrWhiteSpace(model.MetricsJson) || model.MetricsJson == "{}";
+            if (isEmpty || seen.Contains(model.Name))
+                toDelete.Add(model);
+            else
+                seen.Add(model.Name);
+        }
+
+        _db.MlModels.RemoveRange(toDelete);
+        await _db.SaveChangesAsync();
+        return Ok(new { deleted = toDelete.Count, remaining = allModels.Count - toDelete.Count });
+    }
+
     [HttpGet("chart/feature-importance")]
     [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant + "," + SystemRoles.Staff)]
     public Task<IActionResult> GetFeatureImportanceChart()
@@ -249,18 +278,32 @@ public class MlPredictionController : ControllerBase
     [HttpGet("chart/risk-distribution")]
     [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant + "," + SystemRoles.Staff)]
     public Task<IActionResult> GetRiskDistributionChart([FromQuery] string? dataset)
-        => GetChartFromMlServiceAsync<RiskDistributionChartResponse>(
-            cacheKey: $"chart_risk_distribution:{(string.IsNullOrWhiteSpace(dataset) ? "default" : dataset)}",
-            relativePath: string.IsNullOrWhiteSpace(dataset) ? "chart/risk-distribution" : $"chart/risk-distribution?dataset={Uri.EscapeDataString(dataset)}"
-        );
+    {
+        var cacheKey = $"chart_risk_distribution:{(string.IsNullOrWhiteSpace(dataset) ? "default" : dataset)}";
+        var relativePath = string.IsNullOrWhiteSpace(dataset) ? "chart/risk-distribution" : $"chart/risk-distribution?dataset={Uri.EscapeDataString(dataset)}";
+        var ttl = string.IsNullOrWhiteSpace(dataset) ? TimeSpan.FromMinutes(5) : TimeSpan.FromSeconds(30);
+        return GetChartFromMlServiceAsync<RiskDistributionChartResponse>(cacheKey: cacheKey, relativePath: relativePath, ttl: ttl);
+    }
 
     [HttpGet("chart/probability-histogram")]
     [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant + "," + SystemRoles.Staff)]
     public Task<IActionResult> GetProbabilityHistogramChart([FromQuery] string? dataset)
-        => GetChartFromMlServiceAsync<ProbabilityHistogramChartResponse>(
-            cacheKey: $"chart_probability_histogram:{(string.IsNullOrWhiteSpace(dataset) ? "default" : dataset)}",
-            relativePath: string.IsNullOrWhiteSpace(dataset) ? "chart/probability-histogram" : $"chart/probability-histogram?dataset={Uri.EscapeDataString(dataset)}"
-        );
+    {
+        var cacheKey = $"chart_probability_histogram:{(string.IsNullOrWhiteSpace(dataset) ? "default" : dataset)}";
+        var relativePath = string.IsNullOrWhiteSpace(dataset) ? "chart/probability-histogram" : $"chart/probability-histogram?dataset={Uri.EscapeDataString(dataset)}";
+        var ttl = string.IsNullOrWhiteSpace(dataset) ? TimeSpan.FromMinutes(5) : TimeSpan.FromSeconds(30);
+        return GetChartFromMlServiceAsync<ProbabilityHistogramChartResponse>(cacheKey: cacheKey, relativePath: relativePath, ttl: ttl);
+    }
+
+    [HttpPost("chart/cache/clear")]
+    [Authorize(Roles = SystemRoles.Admin)]
+    public IActionResult ClearChartCache()
+    {
+        _memoryCache.Remove("chart_feature_importance");
+        _memoryCache.Remove("chart_risk_distribution:default");
+        _memoryCache.Remove("chart_probability_histogram:default");
+        return Ok(new { cleared = true });
+    }
 
     [HttpGet("training/history")]
     [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant + "," + SystemRoles.Staff)]
@@ -374,8 +417,54 @@ public class MlPredictionController : ControllerBase
         var safeFileName = $"{DateTime.UtcNow:yyyyMMddHHmmssfff}_{Path.GetFileName(file.FileName)}";
         var targetPath = Path.Combine(uploadsRoot, safeFileName);
 
-        await using var stream = System.IO.File.Create(targetPath);
-        await file.CopyToAsync(stream);
+        // Write the file and close the stream before attempting the copy
+        await using (var stream = System.IO.File.Create(targetPath))
+        {
+            await file.CopyToAsync(stream);
+        }
+
+        // Copy to shared folder so the Python ML service can find the file
+        try
+        {
+            var sharedUploadsDir = FindSharedUploadsDirectory();
+            if (sharedUploadsDir is null)
+            {
+                // try fallback to solution root -> PropertyTax_ML/datasets/uploads
+                var solRoot = FindSolutionRoot();
+                if (!string.IsNullOrWhiteSpace(solRoot))
+                {
+                    var candidate = Path.Combine(solRoot, "PropertyTax_ML", "datasets", "uploads");
+                    sharedUploadsDir = candidate;
+                }
+            }
+
+                if (sharedUploadsDir is not null)
+                {
+                    _logger.LogInformation("Shared uploads dir resolved to: {Dir}", sharedUploadsDir ?? "null");
+                    Directory.CreateDirectory(sharedUploadsDir!);
+                    var sharedPath = Path.Combine(sharedUploadsDir!, safeFileName);
+
+                // Ensure file is saved with UTF-8 encoding to avoid reading issues in Python/pandas
+                try
+                {
+                    using var srcStream = System.IO.File.OpenRead(targetPath);
+                    using var reader = new System.IO.StreamReader(srcStream, detectEncodingFromByteOrderMarks: true);
+                    var content = reader.ReadToEnd();
+                    System.IO.File.WriteAllText(sharedPath, content, System.Text.Encoding.UTF8);
+                }
+                catch (Exception)
+                {
+                    // Fallback to simple copy if re-encoding fails
+                    System.IO.File.Copy(targetPath, sharedPath, overwrite: true);
+                }
+
+                _logger.LogInformation("Dataset copied to shared folder: {SharedPath}", sharedPath);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to copy dataset to shared ML folder (upload itself succeeded).");
+        }
 
         return Ok(ApiResponse<object>.Ok(new
         {
@@ -455,6 +544,18 @@ public class MlPredictionController : ControllerBase
         try
         {
             System.IO.File.Delete(fullTarget);
+
+            // Also remove from the shared folder
+            var sharedUploadsDir = FindSharedUploadsDirectory();
+            if (sharedUploadsDir is not null)
+            {
+                var sharedPath = Path.Combine(sharedUploadsDir, storedFileName);
+                if (System.IO.File.Exists(sharedPath))
+                {
+                    System.IO.File.Delete(sharedPath);
+                }
+            }
+
             await Task.CompletedTask;
             return Ok(ApiResponse<object>.Ok(new { storedAs = storedFileName }, "Dataset deleted."));
         }
@@ -525,7 +626,7 @@ public class MlPredictionController : ControllerBase
         };
     }
 
-    private async Task<IActionResult> GetChartFromMlServiceAsync<T>(string cacheKey, string relativePath) where T : class
+    private async Task<IActionResult> GetChartFromMlServiceAsync<T>(string cacheKey, string relativePath, TimeSpan? ttl = null) where T : class
     {
         if (_memoryCache.TryGetValue(cacheKey, out T? cached) && cached is not null)
         {
@@ -566,7 +667,7 @@ public class MlPredictionController : ControllerBase
                 return StatusCode(503, new { error = "ML service unavailable" });
             }
 
-            _memoryCache.Set(cacheKey, parsed, TimeSpan.FromMinutes(5));
+            _memoryCache.Set(cacheKey, parsed, ttl ?? TimeSpan.FromMinutes(5));
             return Ok(parsed);
         }
         catch
@@ -608,10 +709,10 @@ public class MlPredictionController : ControllerBase
         models = new List<object>();
 
         var resultsPath = FindMlArtifactPath("propertytax_model_selection_results.csv");
-        var featureInfoPath = FindMlArtifactPath("propertytax_feature_info.json");
 
-        if (resultsPath is null || featureInfoPath is null)
+        if (resultsPath is null)
         {
+            _logger.LogWarning("Missing ML artifact path. resultsPath exists: {ResultsExists}", resultsPath != null);
             return false;
         }
 
@@ -623,11 +724,11 @@ public class MlPredictionController : ControllerBase
 
             if (csvLines.Length < 2)
             {
+                _logger.LogWarning("Model selection results CSV contains no data rows.");
                 return false;
             }
 
             var headers = ParseCsvLine(csvLines[0]).Select(header => header.Trim().ToLowerInvariant()).ToArray();
-            var bestModelName = ReadBestModelName(featureInfoPath);
             var trainedAt = System.IO.File.GetLastWriteTimeUtc(resultsPath);
 
             int FindColumn(params string[] names)
@@ -651,13 +752,34 @@ public class MlPredictionController : ControllerBase
             var testF1Index = FindColumn("test_f1", "testf1");
             var testRocAucIndex = FindColumn("test_roc_auc", "testrocauc");
 
+            _logger.LogInformation("Parsed CSV Headers: {Headers}", string.Join(", ", headers));
+            _logger.LogInformation("CSV Column positions - Model: {ModelIdx}, Accuracy: {AccIdx}, Precision: {PrecIdx}, Recall: {RecIdx}, F1: {F1Idx}, RocAuc: {RocAucIdx}, CvMean: {CvMeanIdx}",
+                modelIndex, testAccuracyIndex, testPrecisionIndex, testRecallIndex, testF1Index, testRocAucIndex, cvRocAucMeanIndex);
+
             if (modelIndex < 0 || testAccuracyIndex < 0 || testF1Index < 0 || testRocAucIndex < 0)
             {
+                _logger.LogWarning("One or more required CSV column headers are missing.");
                 return false;
             }
 
-            var rows = csvLines.Skip(1).Select(ParseCsvLine).Where(values => values.Count > 0).ToList();
+            var parsedRows = csvLines.Skip(1).Select(ParseCsvLine).Where(values => values.Count > 0).ToList();
 
+            bool HasMeaningfulMetrics(IReadOnlyList<string> values)
+            {
+                return ReadDecimal(values, testAccuracyIndex) > 0m
+                    || ReadDecimal(values, testPrecisionIndex) > 0m
+                    || ReadDecimal(values, testRecallIndex) > 0m
+                    || ReadDecimal(values, testF1Index) > 0m
+                    || ReadDecimal(values, testRocAucIndex) > 0m;
+            }
+
+            var rows = parsedRows.Where(HasMeaningfulMetrics).ToList();
+            if (rows.Count == 0)
+            {
+                rows = parsedRows;
+            }
+
+            var normalizedRows = new List<(string ModelName, IReadOnlyList<string> Values, decimal Accuracy, decimal Precision, decimal Recall, decimal F1Score, decimal RocAuc, int Order)>();
             for (var i = 0; i < rows.Count; i += 1)
             {
                 var values = rows[i];
@@ -672,9 +794,68 @@ public class MlPredictionController : ControllerBase
                     continue;
                 }
 
+                normalizedRows.Add((
+                    modelName,
+                    values,
+                    ReadDecimal(values, testAccuracyIndex),
+                    ReadDecimal(values, testPrecisionIndex),
+                    ReadDecimal(values, testRecallIndex),
+                    ReadDecimal(values, testF1Index),
+                    ReadDecimal(values, testRocAucIndex),
+                    i));
+            }
+
+            var dedupedRows = normalizedRows
+                .GroupBy(row => row.ModelName, StringComparer.OrdinalIgnoreCase)
+                .Select(group => group
+                    .OrderByDescending(row => row.F1Score)
+                    .ThenByDescending(row => row.RocAuc)
+                    .ThenByDescending(row => row.Accuracy)
+                    .ThenByDescending(row => row.Order)
+                    .First())
+                .OrderByDescending(row => row.F1Score)
+                .ThenByDescending(row => row.RocAuc)
+                .ThenByDescending(row => row.Accuracy)
+                .ThenBy(row => row.ModelName)
+                .ToList();
+
+            if (dedupedRows.Count == 0)
+            {
+                _logger.LogWarning("No valid model rows could be parsed from the CSV artifacts.");
+                return false;
+            }
+
+            var bestModelName = dedupedRows[0].ModelName;
+            var featureInfoPath = FindMlArtifactPath("propertytax_feature_info.json");
+            if (featureInfoPath is not null)
+            {
+                try
+                {
+                    var featureInfoBestModel = ReadBestModelName(featureInfoPath);
+                    if (!string.IsNullOrWhiteSpace(featureInfoBestModel))
+                    {
+                        bestModelName = featureInfoBestModel;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Unable to read best model name from feature info artifact; falling back to CSV ranking.");
+                }
+            }
+
+            for (var i = 0; i < dedupedRows.Count; i += 1)
+            {
+                var row = dedupedRows[i];
+                var modelName = row.ModelName;
+
                 var version = "v1.0";
-                var displayLabel = $"{modelName} · {version}";
+                var displayLabel = $"{modelName} · {version} · {trainedAt:MMM dd, yyyy}";
                 var isBestModel = string.Equals(modelName, bestModelName, StringComparison.OrdinalIgnoreCase);
+
+                var cvRocAucMean = ReadDecimal(row.Values, cvRocAucMeanIndex);
+
+                _logger.LogInformation("Row {RowIdx} parsed - Model: {ModelName}, Acc: {Acc}, Prec: {Prec}, Rec: {Rec}, F1: {F1}, RocAuc: {RocAuc}, isBest: {IsBest}",
+                    i + 1, modelName, row.Accuracy, row.Precision, row.Recall, row.F1Score, row.RocAuc, isBestModel);
 
                 models.Add(new
                 {
@@ -682,17 +863,17 @@ public class MlPredictionController : ControllerBase
                     name = modelName,
                     version,
                     displayLabel,
-                    accuracy = ReadDecimal(values, testAccuracyIndex),
-                    precision = ReadDecimal(values, testPrecisionIndex),
-                    recall = ReadDecimal(values, testRecallIndex),
-                    f1Score = ReadDecimal(values, testF1Index),
-                    rocAuc = ReadDecimal(values, testRocAucIndex),
-                    cvRocAucMean = ReadDecimal(values, cvRocAucMeanIndex),
-                    testAccuracy = ReadDecimal(values, testAccuracyIndex),
-                    testPrecision = ReadDecimal(values, testPrecisionIndex),
-                    testRecall = ReadDecimal(values, testRecallIndex),
-                    testF1 = ReadDecimal(values, testF1Index),
-                    testRocAuc = ReadDecimal(values, testRocAucIndex),
+                    accuracy = row.Accuracy,
+                    precision = row.Precision,
+                    recall = row.Recall,
+                    f1Score = row.F1Score,
+                    rocAuc = row.RocAuc,
+                    cvRocAucMean,
+                    testAccuracy = row.Accuracy,
+                    testPrecision = row.Precision,
+                    testRecall = row.Recall,
+                    testF1 = row.F1Score,
+                    testRocAuc = row.RocAuc,
                     isBestModel,
                     status = isBestModel ? "Active" : "Archived",
                     lastTrainedAt = trainedAt,
@@ -701,8 +882,9 @@ public class MlPredictionController : ControllerBase
 
             return models.Count > 0;
         }
-        catch
+        catch (Exception ex)
         {
+            _logger.LogError(ex, "Exception in TryBuildModelsFromArtifacts while reading CSV artifacts.");
             models = new List<object>();
             return false;
         }
@@ -768,6 +950,53 @@ public class MlPredictionController : ControllerBase
         return null;
     }
 
+    private string? FindSharedUploadsDirectory()
+    {
+        var mlDir = FindMlDirectory();
+        if (mlDir is not null)
+        {
+            return Path.Combine(mlDir, "datasets", "uploads");
+        }
+
+        var solRoot = FindSolutionRoot();
+        if (!string.IsNullOrWhiteSpace(solRoot))
+        {
+            return Path.Combine(solRoot, "PropertyTax_ML", "datasets", "uploads");
+        }
+
+        return null;
+    }
+
+    private string? FindSolutionRoot()
+    {
+        var searchRoots = new[]
+        {
+            _environment.ContentRootPath,
+            AppContext.BaseDirectory,
+            Directory.GetCurrentDirectory(),
+        }
+        .Where(path => !string.IsNullOrWhiteSpace(path))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+
+        foreach (var root in searchRoots)
+        {
+            var current = new DirectoryInfo(root!);
+            for (var depth = 0; depth < 8 && current is not null; depth += 1)
+            {
+                var candidate = Path.Combine(current.FullName, "PropertyTax.slnx");
+                if (System.IO.File.Exists(candidate))
+                {
+                    return current.FullName;
+                }
+
+                current = current.Parent;
+            }
+        }
+
+        return null;
+    }
+
     private static string ReadBestModelName(string featureInfoPath)
     {
         try
@@ -775,7 +1004,7 @@ public class MlPredictionController : ControllerBase
             using var document = JsonDocument.Parse(System.IO.File.ReadAllText(featureInfoPath));
             if (document.RootElement.TryGetProperty("best_model_name", out var bestModelName) && bestModelName.ValueKind == JsonValueKind.String)
             {
-                return bestModelName.GetString() ?? string.Empty;
+                return bestModelName.GetString()?.Trim() ?? string.Empty;
             }
         }
         catch
@@ -967,10 +1196,90 @@ public class MlPredictionController : ControllerBase
                         job.Model.CreatedAt = DateTime.UtcNow;
                     }
 
+                    // Promote the retrained model to active, deactivate all others
+                    var allModels = await db.MlModels.ToListAsync();
+                    foreach (var m in allModels)
+                        m.IsActive = m.Id == job.ModelId;
+
                     job.Status = "Completed";
                     job.FinishedAt = DateTime.UtcNow;
                     job.Logs = $"{job.Logs}{Environment.NewLine}[{DateTime.UtcNow:O}] Training completed successfully! Real computed evaluation metrics stored.";
                     await db.SaveChangesAsync();
+
+                    // After job.Status = "Completed", update per-model metrics from CSV
+                    var csvPath = FindMlArtifactPath("propertytax_model_selection_results.csv");
+                    if (csvPath is not null)
+                    {
+                        var csvLines = System.IO.File.ReadAllLines(csvPath)
+                            .Where(l => !string.IsNullOrWhiteSpace(l)).ToArray();
+                        if (csvLines.Length >= 2)
+                        {
+                            var headers = ParseCsvLine(csvLines[0])
+                                .Select(h => h.Trim().ToLowerInvariant()).ToArray();
+                            var modelIdx = Array.IndexOf(headers, "model");
+                            var accIdx = Array.IndexOf(headers, "test_accuracy");
+                            var precIdx = Array.IndexOf(headers, "test_precision");
+                            var recIdx = Array.IndexOf(headers, "test_recall");
+                            var f1Idx = Array.IndexOf(headers, "test_f1");
+                            var rocIdx = Array.IndexOf(headers, "test_roc_auc");
+
+                            foreach (var line in csvLines.Skip(1))
+                            {
+                                var cols = ParseCsvLine(line);
+                                if (modelIdx < 0 || modelIdx >= cols.Count) continue;
+                                var csvModelName = cols[modelIdx].Trim();
+                                if (string.IsNullOrWhiteSpace(csvModelName)) continue;
+
+                                var dbModel = await db.MlModels
+                                    .FirstOrDefaultAsync(m => m.Name.ToLower() == csvModelName.ToLower());
+
+                                // Create a new DB entry if the model doesn't exist yet
+                                if (dbModel is null)
+                                {
+                                    dbModel = new MlModel
+                                    {
+                                        Name = csvModelName,
+                                        Version = "v1.0",
+                                        MetricsJson = "{}",
+                                        ArtifactPath = string.Empty,
+                                        IsActive = false,
+                                        CreatedAt = DateTime.UtcNow,
+                                    };
+                                    db.MlModels.Add(dbModel);
+                                    await db.SaveChangesAsync();
+                                }
+
+                                dbModel.MetricsJson = System.Text.Json.JsonSerializer.Serialize(new
+                                {
+                                    accuracy = ReadDecimal(cols, accIdx),
+                                    precision = ReadDecimal(cols, precIdx),
+                                    recall = ReadDecimal(cols, recIdx),
+                                    f1Score = ReadDecimal(cols, f1Idx),
+                                    rocAuc = ReadDecimal(cols, rocIdx),
+                                });
+                                dbModel.CreatedAt = DateTime.UtcNow;
+                            }
+                            await db.SaveChangesAsync();
+                        }
+                    }
+
+                    // After saving per-model metrics, delete duplicate model entries (same name, keep most recent with non-zero metrics)
+                    var allModelsAfterUpdate = await db.MlModels.OrderByDescending(m => m.CreatedAt).ToListAsync();
+                    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    var toDelete = new List<MlModel>();
+                    foreach (var m in allModelsAfterUpdate)
+                    {
+                        var isEmpty = string.IsNullOrWhiteSpace(m.MetricsJson) || m.MetricsJson.Trim() == "{}";
+                        if (isEmpty || seen.Contains(m.Name))
+                            toDelete.Add(m);
+                        else
+                            seen.Add(m.Name);
+                    }
+                    if (toDelete.Any())
+                    {
+                        db.MlModels.RemoveRange(toDelete);
+                        await db.SaveChangesAsync();
+                    }
                 }
                 else
                 {
