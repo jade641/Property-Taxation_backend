@@ -204,7 +204,7 @@ public class MlPredictionController : ControllerBase
     }
 
     [HttpGet("models")]
-    [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant + "," + SystemRoles.Staff)]
+    [AllowAnonymous]
     public async Task<IActionResult> GetModels()
     {
         var result = TryBuildModelsFromArtifacts(out var artifactModels);
@@ -331,7 +331,7 @@ public class MlPredictionController : ControllerBase
     }
 
     [HttpGet("status")]
-    [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant + "," + SystemRoles.Staff)]
+    [AllowAnonymous]
     public async Task<IActionResult> GetTrainingStatus()
     {
         var activeModel = await _db.MlModels
@@ -1206,9 +1206,29 @@ public class MlPredictionController : ControllerBase
             return 0m;
         }
 
-        return decimal.TryParse(values[index], NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
-            ? parsed
-            : 0m;
+        var raw = (values[index] ?? string.Empty).Trim();
+
+        // Accept values like "96.20%", "96.20", "0.9620" and numbers with thousands separators.
+        if (raw.EndsWith("%", StringComparison.Ordinal))
+        {
+            raw = raw.Substring(0, raw.Length - 1).Trim();
+        }
+
+        // Remove common thousands separators so parsing succeeds (e.g. "1,234.56").
+        raw = raw.Replace(",", string.Empty);
+
+        if (decimal.TryParse(raw, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var parsed))
+        {
+            // If the exporter wrote percentages as 96.20 (rather than 0.9620), normalize to 0..1
+            if (parsed > 1m)
+            {
+                parsed /= 100m;
+            }
+
+            return parsed;
+        }
+
+        return 0m;
     }
 
     private TrainingStatusResponse BuildTrainingStatusResponse(MlTrainingJob? job, MlModel? activeModel)

@@ -162,8 +162,9 @@ if (corsOrigins.Length > 0 || allowAnyOrigin)
             else
             {
                 policy.SetIsOriginAllowed(origin => IsAllowedFrontendOrigin(origin, corsOrigins))
-                    .WithHeaders("Authorization", "Content-Type", "Accept")
-                    .WithMethods("GET", "POST", "PUT", "DELETE", "OPTIONS");
+                    .AllowAnyHeader()
+                    .AllowAnyMethod()
+                    .AllowCredentials();
             }
         });
     });
