@@ -5,6 +5,7 @@ namespace PropertyTax.API.Services;
 internal static class MlPathResolver
 {
     private const string MlFolderName = "PropertyTax_ML";
+    private const string BundledArtifactsFolderName = "MlArtifacts";
     private const string SolutionFileName = "PropertyTax.slnx";
 
     private static readonly string[] MlRootMarkers =
@@ -55,15 +56,44 @@ internal static class MlPathResolver
     public static string? ResolveMlArtifactPath(IConfiguration configuration, string fileName, params string?[] searchRoots)
     {
         var mlDirectory = ResolveMlDirectory(configuration, searchRoots);
-        if (string.IsNullOrWhiteSpace(mlDirectory))
+        if (!string.IsNullOrWhiteSpace(mlDirectory))
         {
-            return null;
+            var artifactPath = Path.Combine(mlDirectory, "models", fileName);
+            if (File.Exists(artifactPath))
+            {
+                return artifactPath;
+            }
         }
 
-        var artifactPath = Path.Combine(mlDirectory, "models", fileName);
-        return File.Exists(artifactPath)
-            ? artifactPath
-            : null;
+        return ResolveBundledArtifactPath(configuration, fileName, searchRoots);
+    }
+
+    private static string? ResolveBundledArtifactPath(IConfiguration configuration, string fileName, params string?[] searchRoots)
+    {
+        var configuredArtifactsRoot = configuration["PropertyTaxMlArtifactsRoot"]
+            ?? configuration["PROPERTYTAX_ML_ARTIFACTS_ROOT"]
+            ?? configuration["PROPERTYTAX_ML_ARTIFACTS_DIR"];
+
+        var candidates = new List<string>();
+
+        if (!string.IsNullOrWhiteSpace(configuredArtifactsRoot))
+        {
+            candidates.Add(Path.Combine(configuredArtifactsRoot, fileName));
+            candidates.Add(Path.Combine(configuredArtifactsRoot, "models", fileName));
+        }
+
+        foreach (var root in NormalizeSearchRoots(searchRoots))
+        {
+            candidates.Add(Path.Combine(root, BundledArtifactsFolderName, fileName));
+            candidates.Add(Path.Combine(root, MlFolderName, "models", fileName));
+        }
+
+        return candidates
+            .Select(NormalizeFullPath)
+            .Where(path => !string.IsNullOrWhiteSpace(path) && File.Exists(path))
+            .OrderBy(path => ScoreCandidate(path!))
+            .ThenBy(path => path!.Length)
+            .FirstOrDefault();
     }
 
     public static string? ResolveSolutionRoot(params string?[] searchRoots)

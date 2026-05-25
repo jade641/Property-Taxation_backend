@@ -1030,21 +1030,86 @@ public class MlPredictionController : ControllerBase
             LastTrainedAt: model.CreatedAt);
     }
 
-    private List<ModelSummaryResponse> BuildCanonicalModelSummaries(IReadOnlyList<MlModel> databaseModels)
+    private static bool HasMeaningfulMetrics(ModelSummaryResponse model)
     {
-        if (TryBuildArtifactModelSummaries(out var artifactModels))
+        return model.Accuracy > 0m
+            || model.Precision > 0m
+            || model.Recall > 0m
+            || model.F1Score > 0m
+            || model.RocAuc > 0m;
+    }
+
+    private static List<ModelSummaryResponse> BuildDatabaseModelSummaries(IReadOnlyList<MlModel> databaseModels)
+    {
+        return databaseModels
+            .Where(model => !string.IsNullOrWhiteSpace(model.Name))
+            .OrderByDescending(model => model.CreatedAt)
+            .Select(BuildDbModelSummary)
+            .Where(HasMeaningfulMetrics)
+            .GroupBy(model => NormalizeModelKey(model.Name), StringComparer.OrdinalIgnoreCase)
+            .Where(group => !string.IsNullOrWhiteSpace(group.Key))
+            .Select(group => group
+                .OrderByDescending(model => model.LastTrainedAt)
+                .ThenByDescending(model => model.IsBestModel)
+                .First())
+            .OrderByDescending(model => model.F1Score)
+            .ThenByDescending(model => model.RocAuc)
+            .ThenByDescending(model => model.Accuracy)
+            .ThenBy(model => model.Name)
+            .ToList();
+    }
+
+    private static bool HasHealthyDatabaseModelState(IReadOnlyList<ModelSummaryResponse> databaseModels)
+    {
+        if (databaseModels.Count == 0)
         {
-            var mergedModels = MergeArtifactModelsWithDatabase(databaseModels, artifactModels);
-            if (mergedModels.Count > 0)
+            return false;
+        }
+
+        if (databaseModels.Count > 1)
+        {
+            var activeCount = databaseModels.Count(model => model.IsBestModel);
+            if (activeCount != 1)
             {
-                return mergedModels;
+                return false;
+            }
+
+            var uniqueMetricPatterns = databaseModels
+                .Select(model => string.Join('|',
+                    model.Accuracy.ToString("0.############", CultureInfo.InvariantCulture),
+                    model.Precision.ToString("0.############", CultureInfo.InvariantCulture),
+                    model.Recall.ToString("0.############", CultureInfo.InvariantCulture),
+                    model.F1Score.ToString("0.############", CultureInfo.InvariantCulture),
+                    model.RocAuc.ToString("0.############", CultureInfo.InvariantCulture)))
+                .Distinct(StringComparer.Ordinal)
+                .Count();
+
+            if (uniqueMetricPatterns == 1)
+            {
+                return false;
             }
         }
 
-        return databaseModels
-            .Select(BuildDbModelSummary)
-            .Where(model => model.Accuracy > 0m || model.F1Score > 0m)
-            .ToList();
+        return true;
+    }
+
+    private List<ModelSummaryResponse> BuildCanonicalModelSummaries(IReadOnlyList<MlModel> databaseModels)
+    {
+        var dbModelSummaries = BuildDatabaseModelSummaries(databaseModels);
+
+        if (TryBuildArtifactModelSummaries(out var artifactModels))
+        {
+            if (!HasHealthyDatabaseModelState(dbModelSummaries))
+            {
+                var mergedModels = MergeArtifactModelsWithDatabase(databaseModels, artifactModels);
+                if (mergedModels.Count > 0)
+                {
+                    return mergedModels;
+                }
+            }
+        }
+
+        return dbModelSummaries;
     }
 
     private List<ModelSummaryResponse> MergeArtifactModelsWithDatabase(IReadOnlyList<MlModel> databaseModels, IReadOnlyList<ModelSummaryResponse> artifactModels)
@@ -1546,6 +1611,55 @@ public class MlPredictionController : ControllerBase
         return 0m;
     }
 
+    private void PersistBundledModelMetricsSnapshot(IReadOnlyList<ModelSummaryResponse> models)
+    {
+        if (models.Count == 0)
+        {
+            return;
+        }
+
+        var artifactsDirectory = Path.Combine(AppContext.BaseDirectory, "MlArtifacts");
+        Directory.CreateDirectory(artifactsDirectory);
+
+        var csvBuilder = new StringBuilder();
+        csvBuilder.AppendLine("model,cv_roc_auc_mean,cv_roc_auc_std,test_accuracy,test_precision,test_recall,test_f1,test_roc_auc");
+
+        foreach (var model in models.Where(HasMeaningfulMetrics))
+        {
+            csvBuilder.Append(EscapeCsvValue(model.Name));
+            csvBuilder.Append(',');
+            csvBuilder.Append(model.CvRocAucMean.ToString("0.############", CultureInfo.InvariantCulture));
+            csvBuilder.Append(',');
+            csvBuilder.Append("0");
+            csvBuilder.Append(',');
+            csvBuilder.Append(model.Accuracy.ToString("0.############", CultureInfo.InvariantCulture));
+            csvBuilder.Append(',');
+            csvBuilder.Append(model.Precision.ToString("0.############", CultureInfo.InvariantCulture));
+            csvBuilder.Append(',');
+            csvBuilder.Append(model.Recall.ToString("0.############", CultureInfo.InvariantCulture));
+            csvBuilder.Append(',');
+            csvBuilder.Append(model.F1Score.ToString("0.############", CultureInfo.InvariantCulture));
+            csvBuilder.Append(',');
+            csvBuilder.Append(model.RocAuc.ToString("0.############", CultureInfo.InvariantCulture));
+            csvBuilder.AppendLine();
+        }
+
+        System.IO.File.WriteAllText(
+            Path.Combine(artifactsDirectory, "propertytax_model_selection_results.csv"),
+            csvBuilder.ToString(),
+            Encoding.UTF8);
+    }
+
+    private static string EscapeCsvValue(string value)
+    {
+        if (value.Contains('"') || value.Contains(',') || value.Contains('\n') || value.Contains('\r'))
+        {
+            return $"\"{value.Replace("\"", "\"\"")}\"";
+        }
+
+        return value;
+    }
+
     private TrainingStatusResponse BuildTrainingStatusResponse(MlTrainingJob? job, MlModel? activeModel, ModelSummaryResponse? activeModelSummary)
     {
         var modelName = job?.Model?.Name
@@ -1895,6 +2009,16 @@ public class MlPredictionController : ControllerBase
                     {
                         db.MlModels.RemoveRange(toDelete);
                         await db.SaveChangesAsync();
+                    }
+
+                    try
+                    {
+                        var databaseModelSummaries = BuildDatabaseModelSummaries(await db.MlModels.AsNoTracking().ToListAsync());
+                        PersistBundledModelMetricsSnapshot(databaseModelSummaries);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Unable to refresh bundled model metrics snapshot after training.");
                     }
 
                     job.Logs = $"{job.Logs}{Environment.NewLine}[{DateTime.UtcNow:O}] Refreshing live ML service with the latest trained artifacts...";

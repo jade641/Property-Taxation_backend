@@ -42,6 +42,17 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Content Update="MlArtifacts\**\*.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <None Update="MlArtifacts\**\*.csv">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
     <Content Include="..\..\..\PropertyTax_ML\**\*"
              Exclude="..\..\..\PropertyTax_ML\.venv\**\*;..\..\..\PropertyTax_ML\**\__pycache__\**\*;..\..\..\PropertyTax_ML\**\.ipynb_checkpoints\**\*;..\..\..\PropertyTax_ML\diagnostics\**\*">
       <Link>PropertyTax_ML\%(RecursiveDir)%(Filename)%(Extension)</Link>
