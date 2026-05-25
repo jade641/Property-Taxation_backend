@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -26,10 +27,12 @@ public class MlPredictionController : ControllerBase
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly IMemoryCache _memoryCache;
     private readonly IConfiguration _configuration;
+    private readonly IMlServiceCoordinator _mlServiceCoordinator;
     private readonly IServiceScopeFactory _serviceScopeFactory;
     private readonly ILogger<MlPredictionController> _logger;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private static long _chartCacheGeneration = 1;
 
     public MlPredictionController(
         IMlPredictionService predictionService,
@@ -38,6 +41,7 @@ public class MlPredictionController : ControllerBase
         IHttpClientFactory httpClientFactory,
         IMemoryCache memoryCache,
         IConfiguration configuration,
+        IMlServiceCoordinator mlServiceCoordinator,
         IServiceScopeFactory serviceScopeFactory,
         ILogger<MlPredictionController> logger)
     {
@@ -47,6 +51,7 @@ public class MlPredictionController : ControllerBase
         _httpClientFactory = httpClientFactory;
         _memoryCache = memoryCache;
         _configuration = configuration;
+        _mlServiceCoordinator = mlServiceCoordinator;
         _serviceScopeFactory = serviceScopeFactory;
         _logger = logger;
     }
@@ -158,6 +163,131 @@ public class MlPredictionController : ControllerBase
         return Ok(ApiResponse<object>.Ok(items));
     }
 
+    [HttpGet("alerts")]
+    [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant + "," + SystemRoles.Staff)]
+    public async Task<IActionResult> GetAlerts()
+    {
+        try
+        {
+            var alerts = await _db.MlAlerts
+                .AsNoTracking()
+                .Include(alert => alert.Property)
+                    .ThenInclude(property => property!.Taxpayer)
+                .OrderBy(alert => alert.Status == "Open" ? 0 : alert.Status == "Resolved" ? 1 : 2)
+                .ThenByDescending(alert => alert.CreatedAt)
+                .Take(6)
+                .ToListAsync();
+
+            var items = alerts.Select(BuildAlertResponse).ToList();
+            return Ok(ApiResponse<object>.Ok(items));
+        }
+        catch (Exception ex) when (IsMissingMlAlertsTableException(ex))
+        {
+            _logger.LogWarning(ex, "ML alerts table is unavailable. Returning an empty alerts list until the schema is aligned.");
+            return Ok(ApiResponse<object>.Ok(Array.Empty<object>()));
+        }
+    }
+
+    [HttpPost("alerts/{id:int}/resolve")]
+    [Authorize(Roles = SystemRoles.Admin)]
+    public Task<IActionResult> ResolveAlert(int id)
+        => UpdateAlertStatusAsync(id, "Resolved");
+
+    [HttpPost("alerts/{id:int}/dismiss")]
+    [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant + "," + SystemRoles.Staff)]
+    public Task<IActionResult> DismissAlert(int id)
+        => UpdateAlertStatusAsync(id, "Dismissed");
+
+    private async Task<IActionResult> UpdateAlertStatusAsync(int id, string nextStatus)
+    {
+        MlAlert? alert;
+
+        try
+        {
+            alert = await _db.MlAlerts
+                .Include(item => item.Property)
+                    .ThenInclude(property => property!.Taxpayer)
+                .FirstOrDefaultAsync(item => item.Id == id);
+        }
+        catch (Exception ex) when (IsMissingMlAlertsTableException(ex))
+        {
+            _logger.LogWarning(ex, "ML alerts table is unavailable. Alert status updates are disabled until the schema is aligned.");
+            return NotFound(ApiResponse<object?>.Fail("Alert storage is not available yet."));
+        }
+
+        if (alert is null)
+        {
+            return NotFound(ApiResponse<object?>.Fail("Alert not found."));
+        }
+
+        alert.Status = nextStatus;
+        await _db.SaveChangesAsync();
+
+        return Ok(ApiResponse<object>.Ok(BuildAlertResponse(alert), $"Alert marked as {nextStatus.ToLowerInvariant()}."));
+    }
+
+    private object BuildAlertResponse(MlAlert alert)
+    {
+        var propertyReference = alert.Property?.Pin ?? alert.PropertyId.ToString(CultureInfo.InvariantCulture);
+        var normalizedSeverity = NormalizeAlertSeverity(alert.Severity);
+
+        return new
+        {
+            id = alert.Id,
+            title = string.IsNullOrWhiteSpace(alert.Title) ? "High-risk property detected" : alert.Title,
+            description = string.IsNullOrWhiteSpace(alert.Description)
+                ? $"Property {propertyReference} was flagged for ML review."
+                : alert.Description,
+            category = DetermineAlertCategory(alert.Description, normalizedSeverity),
+            status = NormalizeAlertStatus(alert.Status),
+            createdAt = alert.CreatedAt,
+            propertyId = propertyReference,
+            severity = normalizedSeverity,
+        };
+    }
+
+    private static string NormalizeAlertSeverity(string? severity)
+    {
+        if (string.Equals(severity, "High", StringComparison.OrdinalIgnoreCase)) return "High";
+        if (string.Equals(severity, "Medium", StringComparison.OrdinalIgnoreCase)) return "Medium";
+        return "Low";
+    }
+
+    private static string NormalizeAlertStatus(string? status)
+    {
+        if (string.Equals(status, "Resolved", StringComparison.OrdinalIgnoreCase)) return "Resolved";
+        if (string.Equals(status, "Dismissed", StringComparison.OrdinalIgnoreCase)) return "Dismissed";
+        return "Open";
+    }
+
+    private static string DetermineAlertCategory(string? description, string severity)
+    {
+        if (!string.IsNullOrWhiteSpace(description) && description.Contains("late payment", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Repeated late payment";
+        }
+
+        return severity == "High" ? "High-risk" : "Audit flag";
+    }
+
+    private static bool IsMissingMlAlertsTableException(Exception? exception)
+    {
+        while (exception is not null)
+        {
+            if (exception.Message.Contains("ml_alerts", StringComparison.OrdinalIgnoreCase)
+                && (exception.Message.Contains("doesn't exist", StringComparison.OrdinalIgnoreCase)
+                    || exception.Message.Contains("does not exist", StringComparison.OrdinalIgnoreCase)
+                    || exception.Message.Contains("unknown table", StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+
+            exception = exception.InnerException;
+        }
+
+        return false;
+    }
+
     [HttpGet("predictions/{id}")]
     [Authorize]
     public async Task<IActionResult> GetById(int id)
@@ -207,23 +337,12 @@ public class MlPredictionController : ControllerBase
     [AllowAnonymous]
     public async Task<IActionResult> GetModels()
     {
-        var result = TryBuildModelsFromArtifacts(out var artifactModels);
-        _logger.LogInformation("TryBuildModelsFromArtifacts returned: {Result}, model count: {Count}", result, artifactModels.Count);
-
-        if (result)
-        {
-            _logger.LogInformation("Serving {Count} models from artifacts", artifactModels.Count);
-            return Ok(ApiResponse<object>.Ok(artifactModels));
-        }
-
-        _logger.LogWarning("TryBuildModelsFromArtifacts returned false, falling back to database");
-
         var models = await _db.MlModels
             .AsNoTracking()
             .OrderByDescending(model => model.CreatedAt)
             .ToListAsync();
 
-        var items = models.Select(model => new
+        var dbItems = models.Select(model => new
         {
             id = model.Id,
             name = model.Name,
@@ -243,9 +362,52 @@ public class MlPredictionController : ControllerBase
             isBestModel = model.IsActive,
             status = model.IsActive ? "Active" : "Archived",
             lastTrainedAt = model.CreatedAt,
-        }).ToList();
+        }).Where(m => m.accuracy > 0m || m.f1Score > 0m).ToList();
 
-        return Ok(ApiResponse<object>.Ok(items));
+        if (dbItems.Any())
+        {
+            _logger.LogInformation("Serving {Count} models from database", dbItems.Count);
+            return Ok(ApiResponse<object>.Ok(dbItems));
+        }
+
+        // Fallback to artifacts if DB is empty
+        var result = TryBuildModelsFromArtifacts(out var artifactModels);
+        _logger.LogInformation("TryBuildModelsFromArtifacts returned: {Result}, model count: {Count}", result, artifactModels.Count);
+
+        if (result)
+        {
+            _logger.LogInformation("Serving {Count} models from artifacts", artifactModels.Count);
+            return Ok(ApiResponse<object>.Ok(artifactModels));
+        }
+
+        return Ok(ApiResponse<object>.Ok(new object[0]));
+    }
+
+    [HttpPost("models/{id:int}/promote")]
+    [Authorize(Roles = SystemRoles.Admin)]
+    public async Task<IActionResult> PromoteModel(int id)
+    {
+        var models = await _db.MlModels.ToListAsync();
+        var selectedModel = models.FirstOrDefault(model => model.Id == id);
+        if (selectedModel is null)
+        {
+            return NotFound(ApiResponse<object?>.Fail("Model not found."));
+        }
+
+        foreach (var model in models)
+        {
+            model.IsActive = model.Id == id;
+        }
+
+        await _db.SaveChangesAsync();
+        InvalidateChartCache();
+
+        return Ok(ApiResponse<object>.Ok(new
+        {
+            id = selectedModel.Id,
+            name = selectedModel.Name,
+            status = "Active",
+        }, "Model promoted successfully."));
     }
 
     [HttpDelete("models/cleanup")]
@@ -273,25 +435,27 @@ public class MlPredictionController : ControllerBase
 
     [HttpGet("chart/feature-importance")]
     [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant + "," + SystemRoles.Staff)]
-    public Task<IActionResult> GetFeatureImportanceChart()
-        => GetChartFromMlServiceAsync<FeatureImportanceChartResponse>("chart_feature_importance", "chart/feature-importance");
+    public Task<IActionResult> GetFeatureImportanceChart([FromQuery(Name = "model_name")] string? modelName)
+        => GetChartFromMlServiceAsync<FeatureImportanceChartResponse>(
+            BuildChartCacheKey("chart_feature_importance", modelName),
+            BuildChartRelativePath("chart/feature-importance", modelName: modelName));
 
     [HttpGet("chart/risk-distribution")]
     [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant + "," + SystemRoles.Staff)]
-    public Task<IActionResult> GetRiskDistributionChart([FromQuery] string? dataset)
+    public Task<IActionResult> GetRiskDistributionChart([FromQuery] string? dataset, [FromQuery(Name = "model_name")] string? modelName)
     {
-        var cacheKey = $"chart_risk_distribution:{(string.IsNullOrWhiteSpace(dataset) ? "default" : dataset)}";
-        var relativePath = string.IsNullOrWhiteSpace(dataset) ? "chart/risk-distribution" : $"chart/risk-distribution?dataset={Uri.EscapeDataString(dataset)}";
+        var cacheKey = BuildChartCacheKey("chart_risk_distribution", dataset, modelName);
+        var relativePath = BuildChartRelativePath("chart/risk-distribution", dataset, modelName);
         var ttl = string.IsNullOrWhiteSpace(dataset) ? TimeSpan.FromMinutes(5) : TimeSpan.FromSeconds(30);
         return GetChartFromMlServiceAsync<RiskDistributionChartResponse>(cacheKey: cacheKey, relativePath: relativePath, ttl: ttl);
     }
 
     [HttpGet("chart/probability-histogram")]
     [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant + "," + SystemRoles.Staff)]
-    public Task<IActionResult> GetProbabilityHistogramChart([FromQuery] string? dataset)
+    public Task<IActionResult> GetProbabilityHistogramChart([FromQuery] string? dataset, [FromQuery(Name = "model_name")] string? modelName)
     {
-        var cacheKey = $"chart_probability_histogram:{(string.IsNullOrWhiteSpace(dataset) ? "default" : dataset)}";
-        var relativePath = string.IsNullOrWhiteSpace(dataset) ? "chart/probability-histogram" : $"chart/probability-histogram?dataset={Uri.EscapeDataString(dataset)}";
+        var cacheKey = BuildChartCacheKey("chart_probability_histogram", dataset, modelName);
+        var relativePath = BuildChartRelativePath("chart/probability-histogram", dataset, modelName);
         var ttl = string.IsNullOrWhiteSpace(dataset) ? TimeSpan.FromMinutes(5) : TimeSpan.FromSeconds(30);
         return GetChartFromMlServiceAsync<ProbabilityHistogramChartResponse>(cacheKey: cacheKey, relativePath: relativePath, ttl: ttl);
     }
@@ -300,9 +464,7 @@ public class MlPredictionController : ControllerBase
     [Authorize(Roles = SystemRoles.Admin)]
     public IActionResult ClearChartCache()
     {
-        _memoryCache.Remove("chart_feature_importance");
-        _memoryCache.Remove("chart_risk_distribution:default");
-        _memoryCache.Remove("chart_probability_histogram:default");
+        InvalidateChartCache();
         return Ok(new { cleared = true });
     }
 
@@ -328,6 +490,30 @@ public class MlPredictionController : ControllerBase
         }).ToList();
 
         return Ok(ApiResponse<object>.Ok(items));
+    }
+
+    [HttpDelete("training/history/{id:int}")]
+    [Authorize(Roles = SystemRoles.Admin)]
+    public async Task<IActionResult> DeleteTrainingHistory(int id)
+    {
+        var job = await _db.MlTrainingJobs.FirstOrDefaultAsync(item => item.Id == id);
+
+        if (job is null)
+        {
+            return NotFound(ApiResponse<object?>.Fail("Training history entry not found."));
+        }
+
+        if (string.Equals(job.Status, "Queued", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(job.Status, "Running", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(job.Status, "Training", StringComparison.OrdinalIgnoreCase))
+        {
+            return BadRequest(ApiResponse<object?>.Fail("A training job that is still in progress cannot be deleted."));
+        }
+
+        _db.MlTrainingJobs.Remove(job);
+        await _db.SaveChangesAsync();
+
+        return Ok(ApiResponse<object>.Ok(new { id }, "Training history entry deleted successfully."));
     }
 
     [HttpGet("status")]
@@ -634,6 +820,11 @@ public class MlPredictionController : ControllerBase
             return Ok(cached);
         }
 
+        if (!await _mlServiceCoordinator.EnsureReadyAsync(requireLoadedModels: true))
+        {
+            return StatusCode(503, new { error = "ML service unavailable" });
+        }
+
         var mlServiceUrl = ResolveMlServiceBaseUrl();
         if (string.IsNullOrWhiteSpace(mlServiceUrl))
         {
@@ -675,6 +866,38 @@ public class MlPredictionController : ControllerBase
         {
             return StatusCode(503, new { error = "ML service unavailable" });
         }
+    }
+
+    private static string BuildChartRelativePath(string path, string? dataset = null, string? modelName = null)
+    {
+        var queryParts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(dataset))
+        {
+            queryParts.Add($"dataset={Uri.EscapeDataString(dataset)}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(modelName))
+        {
+            queryParts.Add($"model_name={Uri.EscapeDataString(modelName)}");
+        }
+
+        return queryParts.Count == 0
+            ? path
+            : $"{path}?{string.Join("&", queryParts)}";
+    }
+
+    private static string BuildChartCacheKey(params string?[] parts)
+    {
+        var normalizedParts = parts
+            .Select(part => string.IsNullOrWhiteSpace(part) ? "default" : part.Trim().ToLowerInvariant())
+            .ToArray();
+
+        return $"chart:v{Interlocked.Read(ref _chartCacheGeneration)}:{string.Join(":", normalizedParts)}";
+    }
+
+    private static void InvalidateChartCache()
+    {
+        Interlocked.Increment(ref _chartCacheGeneration);
     }
 
     private static decimal ParseMetric(string metricsJson, string key)
@@ -742,6 +965,11 @@ public class MlPredictionController : ControllerBase
 
     private async Task<MlServiceTrainingResult> PostMlServiceTrainingAsync(string modelName, string datasetName, Dictionary<string, object>? parameters)
     {
+        if (!await _mlServiceCoordinator.EnsureReadyAsync(requireLoadedModels: false))
+        {
+            throw new InvalidOperationException("ML service is unavailable");
+        }
+
         var mlServiceUrl = ResolveMlServiceBaseUrl();
         if (string.IsNullOrWhiteSpace(mlServiceUrl))
         {
@@ -1018,82 +1246,21 @@ public class MlPredictionController : ControllerBase
 
     private string? FindMlArtifactPath(string fileName)
     {
-        var searchRoots = new[]
-        {
+        return MlPathResolver.ResolveMlArtifactPath(
+            _configuration,
+            fileName,
             _environment.ContentRootPath,
             AppContext.BaseDirectory,
-            Directory.GetCurrentDirectory(),
-        }
-        .Where(path => !string.IsNullOrWhiteSpace(path))
-        .Distinct(StringComparer.OrdinalIgnoreCase)
-        .ToArray();
-
-        foreach (var root in searchRoots)
-        {
-            var current = new DirectoryInfo(root!);
-            for (var depth = 0; depth < 8 && current is not null; depth += 1)
-            {
-                var candidate = Path.Combine(current.FullName, "PropertyTax_ML", "models", fileName);
-                if (System.IO.File.Exists(candidate))
-                {
-                    return candidate;
-                }
-
-                current = current.Parent;
-            }
-        }
-
-        return null;
+            Directory.GetCurrentDirectory());
     }
 
     private string? FindMlDirectory()
     {
-        var configuredRoot = _configuration["PropertyTaxMlRoot"]
-            ?? _configuration["PROPERTYTAX_ML_ROOT"]
-            ?? _configuration["PROPERTYTAX_ML_DIR"];
-
-        if (!string.IsNullOrWhiteSpace(configuredRoot))
-        {
-            try
-            {
-                var configuredCandidate = Path.GetFullPath(configuredRoot);
-                if (Directory.Exists(configuredCandidate))
-                {
-                    return configuredCandidate;
-                }
-            }
-            catch
-            {
-                // Fall back to the normal search roots if the configured path is invalid.
-            }
-        }
-
-        var searchRoots = new[]
-        {
+        return MlPathResolver.ResolveMlDirectory(
+            _configuration,
             _environment.ContentRootPath,
             AppContext.BaseDirectory,
-            Directory.GetCurrentDirectory(),
-        }
-        .Where(path => !string.IsNullOrWhiteSpace(path))
-        .Distinct(StringComparer.OrdinalIgnoreCase)
-        .ToArray();
-
-        foreach (var root in searchRoots)
-        {
-            var current = new DirectoryInfo(root!);
-            for (var depth = 0; depth < 8 && current is not null; depth += 1)
-            {
-                var candidate = Path.Combine(current.FullName, "PropertyTax_ML");
-                if (Directory.Exists(candidate))
-                {
-                    return candidate;
-                }
-
-                current = current.Parent;
-            }
-        }
-
-        return null;
+            Directory.GetCurrentDirectory());
     }
 
     private string? FindSharedUploadsDirectory()
@@ -1115,32 +1282,10 @@ public class MlPredictionController : ControllerBase
 
     private string? FindSolutionRoot()
     {
-        var searchRoots = new[]
-        {
+        return MlPathResolver.ResolveSolutionRoot(
             _environment.ContentRootPath,
             AppContext.BaseDirectory,
-            Directory.GetCurrentDirectory(),
-        }
-        .Where(path => !string.IsNullOrWhiteSpace(path))
-        .Distinct(StringComparer.OrdinalIgnoreCase)
-        .ToArray();
-
-        foreach (var root in searchRoots)
-        {
-            var current = new DirectoryInfo(root!);
-            for (var depth = 0; depth < 8 && current is not null; depth += 1)
-            {
-                var candidate = Path.Combine(current.FullName, "PropertyTax.slnx");
-                if (System.IO.File.Exists(candidate))
-                {
-                    return current.FullName;
-                }
-
-                current = current.Parent;
-            }
-        }
-
-        return null;
+            Directory.GetCurrentDirectory());
     }
 
     private static string ReadBestModelName(string featureInfoPath)
@@ -1295,27 +1440,39 @@ public class MlPredictionController : ControllerBase
                 job.Logs = $"{job.Logs}{Environment.NewLine}[{DateTime.UtcNow:O}] Running model fit and train-test split evaluation...";
                 await db.SaveChangesAsync();
 
-                string output;
+                string output = string.Empty;
                 string error = string.Empty;
 
                 var mlServiceUrl = ResolveMlServiceBaseUrl();
+                var usedMlService = false;
                 if (!string.IsNullOrWhiteSpace(mlServiceUrl))
                 {
-                    job.Logs = $"{job.Logs}{Environment.NewLine}[{DateTime.UtcNow:O}] Sending training request to ML service...";
-                    await db.SaveChangesAsync();
-
-                    var trainingResult = await PostMlServiceTrainingAsync(modelName, datasetName, null);
-
-                    output = JsonSerializer.Serialize(new
+                    try
                     {
-                        success = true,
-                        metrics = trainingResult.Metrics,
-                        artifactPath = trainingResult.ArtifactPath,
-                        best_model_name = trainingResult.BestModelName,
-                        modelMetrics = trainingResult.ModelMetrics,
-                    });
+                        job.Logs = $"{job.Logs}{Environment.NewLine}[{DateTime.UtcNow:O}] Sending training request to ML service...";
+                        await db.SaveChangesAsync();
+
+                        var trainingResult = await PostMlServiceTrainingAsync(modelName, datasetName, null);
+
+                        output = JsonSerializer.Serialize(new
+                        {
+                            success = true,
+                            metrics = trainingResult.Metrics,
+                            artifactPath = trainingResult.ArtifactPath,
+                            best_model_name = trainingResult.BestModelName,
+                            modelMetrics = trainingResult.ModelMetrics,
+                        });
+                        usedMlService = true;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to connect to ML service at {Url}. Checking local python fallback...", mlServiceUrl);
+                        job.Logs = $"{job.Logs}{Environment.NewLine}[{DateTime.UtcNow:O}] Failed to connect to ML service: {ex.Message}. Attempting local Python fallback...";
+                        await db.SaveChangesAsync();
+                    }
                 }
-                else
+
+                if (!usedMlService)
                 {
                     var mlDir = FindMlDirectory();
                     if (string.IsNullOrWhiteSpace(mlDir))
@@ -1415,11 +1572,6 @@ public class MlPredictionController : ControllerBase
                         }
                     }
 
-                    job.Status = "Completed";
-                    job.FinishedAt = DateTime.UtcNow;
-                    job.Logs = $"{job.Logs}{Environment.NewLine}[{DateTime.UtcNow:O}] Training completed successfully! Real computed evaluation metrics stored.";
-                    await db.SaveChangesAsync();
-
                     if (root.TryGetProperty("modelMetrics", out var modelMetricsElement) && modelMetricsElement.ValueKind == JsonValueKind.Array)
                     {
                         foreach (var item in modelMetricsElement.EnumerateArray())
@@ -1462,6 +1614,20 @@ public class MlPredictionController : ControllerBase
                                 rocAuc = item.TryGetProperty("rocAuc", out var rocProp) && rocProp.TryGetDecimal(out var rocValue) ? rocValue : 0m,
                             });
                             dbModel.CreatedAt = DateTime.UtcNow;
+
+                            // Update ArtifactPath to match this specific model
+                            var folder = !string.IsNullOrWhiteSpace(artifactPath) ? Path.GetDirectoryName(artifactPath) : null;
+                            if (string.IsNullOrWhiteSpace(folder))
+                            {
+                                var mlDir = FindMlDirectory();
+                                if (mlDir is not null)
+                                {
+                                    folder = Path.Combine(mlDir, "models");
+                                }
+                            }
+                            var slug = csvModelName.ToLower().Replace(" ", "_");
+                            var modelPklName = $"{slug}_propertytax_model.pkl";
+                            dbModel.ArtifactPath = folder is not null ? Path.Combine(folder, modelPklName) : modelPklName;
                         }
 
                         await db.SaveChangesAsync();
@@ -1520,6 +1686,20 @@ public class MlPredictionController : ControllerBase
                                         rocAuc = ReadDecimal(cols, rocIdx),
                                     });
                                     dbModel.CreatedAt = DateTime.UtcNow;
+
+                                    // Update ArtifactPath to match this specific model
+                                    var folder = !string.IsNullOrWhiteSpace(artifactPath) ? Path.GetDirectoryName(artifactPath) : null;
+                                    if (string.IsNullOrWhiteSpace(folder))
+                                    {
+                                        var mlDir = FindMlDirectory();
+                                        if (mlDir is not null)
+                                        {
+                                            folder = Path.Combine(mlDir, "models");
+                                        }
+                                    }
+                                    var slug = csvModelName.ToLower().Replace(" ", "_");
+                                    var modelPklName = $"{slug}_propertytax_model.pkl";
+                                    dbModel.ArtifactPath = folder is not null ? Path.Combine(folder, modelPklName) : modelPklName;
                                 }
                                 await db.SaveChangesAsync();
                             }
@@ -1543,6 +1723,26 @@ public class MlPredictionController : ControllerBase
                         db.MlModels.RemoveRange(toDelete);
                         await db.SaveChangesAsync();
                     }
+
+                    job.Logs = $"{job.Logs}{Environment.NewLine}[{DateTime.UtcNow:O}] Refreshing live ML service with the latest trained artifacts...";
+                    await db.SaveChangesAsync();
+
+                    if (!usedMlService)
+                    {
+                        job.Logs = $"{job.Logs}{Environment.NewLine}[{DateTime.UtcNow:O}] Local fallback training was used. Forcing the loopback ML service to restart so it loads the newly trained artifacts from the workspace.";
+                        await db.SaveChangesAsync();
+                    }
+
+                    if (!await _mlServiceCoordinator.ReloadAsync(forceRestart: !usedMlService))
+                    {
+                        throw new InvalidOperationException("Training artifacts were saved, but the live ML service could not be refreshed.");
+                    }
+
+                    InvalidateChartCache();
+                    job.Status = "Completed";
+                    job.FinishedAt = DateTime.UtcNow;
+                    job.Logs = $"{job.Logs}{Environment.NewLine}[{DateTime.UtcNow:O}] Training completed successfully! Real computed evaluation metrics stored and the live ML service was refreshed.";
+                    await db.SaveChangesAsync();
                 }
                 else
                 {

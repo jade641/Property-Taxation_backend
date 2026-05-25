@@ -18,14 +18,16 @@ public class MlPredictionService : IMlPredictionService
 {
     private readonly AppDbContext _db;
     private readonly IHttpClientFactory _httpFactory;
+    private readonly IMlServiceCoordinator _mlServiceCoordinator;
     private readonly IConfiguration _config;
     private readonly IHostEnvironment _environment;
     private readonly ILogger<MlPredictionService> _logger;
 
-    public MlPredictionService(AppDbContext db, IHttpClientFactory httpFactory, IConfiguration config, IHostEnvironment environment, ILogger<MlPredictionService> logger)
+    public MlPredictionService(AppDbContext db, IHttpClientFactory httpFactory, IMlServiceCoordinator mlServiceCoordinator, IConfiguration config, IHostEnvironment environment, ILogger<MlPredictionService> logger)
     {
         _db = db;
         _httpFactory = httpFactory;
+        _mlServiceCoordinator = mlServiceCoordinator;
         _config = config;
         _environment = environment;
         _logger = logger;
@@ -69,7 +71,12 @@ public class MlPredictionService : IMlPredictionService
         }
 
         // Build feature payload using feature info ordering - missing values are normalized here and revalidated by the ML service.
-        var featureInfoPath = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PropertyTax_ML", "models", "propertytax_feature_info.json");
+        var featureInfoPath = MlPathResolver.ResolveMlArtifactPath(
+            _config,
+            "propertytax_feature_info.json",
+            _environment.ContentRootPath,
+            AppContext.BaseDirectory,
+            Directory.GetCurrentDirectory());
         Dictionary<string, object?> featurePayload = new Dictionary<string, object?>();
 
         try
@@ -229,6 +236,12 @@ public class MlPredictionService : IMlPredictionService
             ?? Environment.GetEnvironmentVariable("ML_SERVICE_URL")
             ?? (_environment.IsDevelopment() ? "http://localhost:8000" : null)
             ?? throw new InvalidOperationException("ML service base URL is not configured.");
+
+        if (!await _mlServiceCoordinator.EnsureReadyAsync(requireLoadedModels: true))
+        {
+            throw new InvalidOperationException("ML service is unavailable or has no loaded models.");
+        }
+
         var timeoutSecs = _config.GetValue<int?>("MlService:TimeoutSeconds") ?? 10;
         var retries = _config.GetValue<int?>("MlService:RetryCount") ?? 2;
 
@@ -275,10 +288,10 @@ public class MlPredictionService : IMlPredictionService
                 resultPrediction.ExplanationJson = content;
 
                 _db.MlPredictions.Add(resultPrediction);
+                await _db.SaveChangesAsync();
 
                 if (string.Equals(riskLevel, "High", StringComparison.OrdinalIgnoreCase))
                 {
-                    // persist an alert record
                     var alert = new MlAlert
                     {
                         PropertyId = propertyId,
@@ -289,10 +302,22 @@ public class MlPredictionService : IMlPredictionService
                         CreatedAt = DateTime.UtcNow
                     };
 
-                    _db.MlAlerts.Add(alert);
+                    try
+                    {
+                        _db.MlAlerts.Add(alert);
+                        await _db.SaveChangesAsync();
+                    }
+                    catch (Exception ex) when (IsMissingMlAlertsTableException(ex))
+                    {
+                        _logger.LogWarning(ex, "Skipping ML alert persistence because the ml_alerts table is unavailable. Predictions remain enabled.");
+                        _db.Entry(alert).State = EntityState.Detached;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to persist an ML alert. The prediction was saved and the system will continue without a stored alert.");
+                        _db.Entry(alert).State = EntityState.Detached;
+                    }
                 }
-
-                await _db.SaveChangesAsync();
 
                 return resultPrediction;
             }
@@ -323,6 +348,24 @@ public class MlPredictionService : IMlPredictionService
         _db.MlPredictions.Add(resultPrediction);
         await _db.SaveChangesAsync();
         return resultPrediction;
+    }
+
+    private static bool IsMissingMlAlertsTableException(Exception? exception)
+    {
+        while (exception is not null)
+        {
+            if (exception.Message.Contains("ml_alerts", StringComparison.OrdinalIgnoreCase)
+                && (exception.Message.Contains("doesn't exist", StringComparison.OrdinalIgnoreCase)
+                    || exception.Message.Contains("does not exist", StringComparison.OrdinalIgnoreCase)
+                    || exception.Message.Contains("unknown table", StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+
+            exception = exception.InnerException;
+        }
+
+        return false;
     }
 
     private static int ReadPredictionLabel(JsonElement root)

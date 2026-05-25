@@ -62,6 +62,7 @@ public class DbInitializer
             }
 
             await EnsureUserSchemaCompatibilityAsync(connectionTarget);
+            await EnsureMlAlertSchemaCompatibilityAsync(connectionTarget);
 
             await SeedRolesAsync();
             await SeedAdminAsync();
@@ -111,6 +112,58 @@ ADD COLUMN `PasswordResetAttempts` int NOT NULL DEFAULT 0;");
             _logger.LogInformation(
                 "Applied compatibility fix for {ColumnName} on {ConnectionTarget}.",
                 columnName,
+                connectionTarget);
+        }
+        finally
+        {
+            await _dbContext.Database.CloseConnectionAsync();
+        }
+    }
+
+    private async Task EnsureMlAlertSchemaCompatibilityAsync(string connectionTarget)
+    {
+        const string tableName = "ml_alerts";
+
+        await _dbContext.Database.OpenConnectionAsync();
+
+        try
+        {
+            await using var existsCommand = _dbContext.Database.GetDbConnection().CreateCommand();
+            existsCommand.CommandText = @"
+SELECT COUNT(*)
+FROM INFORMATION_SCHEMA.TABLES
+WHERE TABLE_SCHEMA = DATABASE()
+  AND TABLE_NAME = 'ml_alerts';";
+
+            var existingTables = Convert.ToInt64(await existsCommand.ExecuteScalarAsync());
+
+            if (existingTables > 0)
+            {
+                return;
+            }
+
+            _logger.LogWarning(
+                "Missing {TableName} table detected for {ConnectionTarget}. Applying a targeted compatibility fix.",
+                tableName,
+                connectionTarget);
+
+            await _dbContext.Database.ExecuteSqlRawAsync(@"
+CREATE TABLE `ml_alerts` (
+  `Id` int NOT NULL AUTO_INCREMENT,
+  `PropertyId` int NOT NULL,
+  `Title` varchar(200) CHARACTER SET utf8mb4 NOT NULL,
+  `Description` longtext CHARACTER SET utf8mb4 NOT NULL,
+  `Severity` varchar(20) CHARACTER SET utf8mb4 NOT NULL,
+  `Status` varchar(20) CHARACTER SET utf8mb4 NOT NULL,
+  `CreatedAt` datetime NOT NULL,
+  PRIMARY KEY (`Id`),
+  INDEX `IX_ml_alerts_PropertyId` (`PropertyId`),
+  CONSTRAINT `FK_ml_alerts_Properties_PropertyId` FOREIGN KEY (`PropertyId`) REFERENCES `Properties` (`Id`) ON DELETE CASCADE
+) CHARACTER SET = utf8mb4;");
+
+            _logger.LogInformation(
+                "Applied compatibility fix for {TableName} on {ConnectionTarget}.",
+                tableName,
                 connectionTarget);
         }
         finally

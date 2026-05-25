@@ -248,6 +248,9 @@ builder.Services.AddScoped<LocationService>();
 builder.Services.AddScoped<TaxService>();
 builder.Services.AddScoped<PaymentService>();
 builder.Services.AddScoped<DataNotificationService>();
+builder.Services.AddSingleton<MlServiceCoordinator>();
+builder.Services.AddSingleton<IMlServiceCoordinator>(serviceProvider => serviceProvider.GetRequiredService<MlServiceCoordinator>());
+builder.Services.AddHostedService(serviceProvider => serviceProvider.GetRequiredService<MlServiceCoordinator>());
 builder.Services.AddScoped<IMlPredictionService, MlPredictionService>();
 
 var app = builder.Build();
