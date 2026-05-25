@@ -114,6 +114,11 @@ public class MlPredictionController : ControllerBase
         public List<int> HistogramCounts { get; set; } = [0, 0, 0, 0, 0];
     }
 
+    private sealed record RemoteTrainingDatasetPayload(
+        string Dataset,
+        string? DatasetFileName,
+        string? DatasetContentBase64);
+
     private sealed class TrainingStatusResponse
     {
         public string Status { get; set; } = "idle";
@@ -1508,10 +1513,14 @@ public class MlPredictionController : ControllerBase
         client.BaseAddress = new Uri(mlServiceUrl);
         client.Timeout = TimeSpan.FromMinutes(15);
 
+        var datasetPayload = await BuildRemoteTrainingDatasetPayloadAsync(datasetName);
+
         var body = new
         {
             model = modelName,
-            dataset = datasetName,
+            dataset = datasetPayload.Dataset,
+            datasetFileName = datasetPayload.DatasetFileName,
+            datasetContentBase64 = datasetPayload.DatasetContentBase64,
             parameters,
         };
 
@@ -1584,6 +1593,29 @@ public class MlPredictionController : ControllerBase
             Metrics: metrics,
             ArtifactPath: artifactPath,
             ModelMetrics: modelMetrics.Count > 0 ? modelMetrics : null);
+    }
+
+    private async Task<RemoteTrainingDatasetPayload> BuildRemoteTrainingDatasetPayloadAsync(string datasetName)
+    {
+        var normalizedDatasetName = Path.GetFileName(datasetName.Trim());
+        if (string.IsNullOrWhiteSpace(normalizedDatasetName))
+        {
+            normalizedDatasetName = datasetName.Trim();
+        }
+
+        var datasetPath = ResolveUploadedDatasetPath(datasetName);
+        if (string.IsNullOrWhiteSpace(datasetPath))
+        {
+            return new RemoteTrainingDatasetPayload(normalizedDatasetName, null, null);
+        }
+
+        var storedFileName = Path.GetFileName(datasetPath);
+        var datasetBytes = await System.IO.File.ReadAllBytesAsync(datasetPath);
+
+        return new RemoteTrainingDatasetPayload(
+            Dataset: storedFileName,
+            DatasetFileName: storedFileName,
+            DatasetContentBase64: Convert.ToBase64String(datasetBytes));
     }
 
     private bool TryBuildModelsFromArtifacts(out List<object> models)
@@ -1914,6 +1946,29 @@ public class MlPredictionController : ControllerBase
         return 0m;
     }
 
+    private static bool ShouldAllowLocalPythonFallback(string? mlServiceUrl)
+    {
+        if (string.IsNullOrWhiteSpace(mlServiceUrl))
+        {
+            return true;
+        }
+
+        if (!Uri.TryCreate(mlServiceUrl, UriKind.Absolute, out var uri))
+        {
+            return true;
+        }
+
+        if (uri.IsLoopback)
+        {
+            return true;
+        }
+
+        return string.Equals(uri.Host, "localhost", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(uri.Host, "127.0.0.1", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(uri.Host, "::1", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(uri.Host, "0.0.0.0", StringComparison.OrdinalIgnoreCase);
+    }
+
     private void PersistBundledModelMetricsSnapshot(IReadOnlyList<ModelSummaryResponse> models)
     {
         if (models.Count == 0)
@@ -2033,6 +2088,7 @@ public class MlPredictionController : ControllerBase
 
                 var mlServiceUrl = ResolveMlServiceBaseUrl();
                 var usedMlService = false;
+                var allowLocalPythonFallback = ShouldAllowLocalPythonFallback(mlServiceUrl);
                 if (!string.IsNullOrWhiteSpace(mlServiceUrl))
                 {
                     try
@@ -2055,6 +2111,11 @@ public class MlPredictionController : ControllerBase
                     catch (Exception ex)
                     {
                         _logger.LogWarning(ex, "Failed to connect to ML service at {Url}. Checking local python fallback...", mlServiceUrl);
+                        if (!allowLocalPythonFallback)
+                        {
+                            throw new InvalidOperationException($"Remote ML service training failed at {mlServiceUrl}. {ex.Message}", ex);
+                        }
+
                         job.Logs = $"{job.Logs}{Environment.NewLine}[{DateTime.UtcNow:O}] Failed to connect to ML service: {ex.Message}. Attempting local Python fallback...";
                         await db.SaveChangesAsync();
                     }
@@ -2062,6 +2123,11 @@ public class MlPredictionController : ControllerBase
 
                 if (!usedMlService)
                 {
+                    if (!allowLocalPythonFallback)
+                    {
+                        throw new InvalidOperationException("Remote ML service is configured for training, but the training request did not complete.");
+                    }
+
                     var mlDir = FindMlDirectory();
                     if (string.IsNullOrWhiteSpace(mlDir))
                     {
