@@ -108,6 +108,26 @@ public class MlPredictionController : ControllerBase
         public string? Message { get; set; }
     }
 
+    private sealed record ModelSummaryResponse(
+        int Id,
+        string Name,
+        string Version,
+        string DisplayLabel,
+        decimal Accuracy,
+        decimal Precision,
+        decimal Recall,
+        decimal F1Score,
+        decimal RocAuc,
+        decimal CvRocAucMean,
+        decimal TestAccuracy,
+        decimal TestPrecision,
+        decimal TestRecall,
+        decimal TestF1,
+        decimal TestRocAuc,
+        bool IsBestModel,
+        string Status,
+        DateTime LastTrainedAt);
+
     [HttpPost("predictions")]
     [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant)]
     public async Task<IActionResult> Create(CreatePredictionRequest request)
@@ -342,27 +362,17 @@ public class MlPredictionController : ControllerBase
             .OrderByDescending(model => model.CreatedAt)
             .ToListAsync();
 
-        var dbItems = models.Select(model => new
+        var canonicalModels = BuildCanonicalModelSummaries(models);
+        if (canonicalModels.Count > 0)
         {
-            id = model.Id,
-            name = model.Name,
-            version = model.Version,
-            displayLabel = $"{model.Name} · {model.Version}",
-            accuracy = ParseMetric(model.MetricsJson, "accuracy"),
-            precision = ParseMetric(model.MetricsJson, "precision"),
-            recall = ParseMetric(model.MetricsJson, "recall"),
-            f1Score = ParseMetric(model.MetricsJson, "f1Score"),
-            rocAuc = ParseMetric(model.MetricsJson, "rocAuc"),
-            cvRocAucMean = ParseMetric(model.MetricsJson, "cvRocAucMean"),
-            testAccuracy = ParseMetric(model.MetricsJson, "testAccuracy"),
-            testPrecision = ParseMetric(model.MetricsJson, "testPrecision"),
-            testRecall = ParseMetric(model.MetricsJson, "testRecall"),
-            testF1 = ParseMetric(model.MetricsJson, "testF1"),
-            testRocAuc = ParseMetric(model.MetricsJson, "testRocAuc"),
-            isBestModel = model.IsActive,
-            status = model.IsActive ? "Active" : "Archived",
-            lastTrainedAt = model.CreatedAt,
-        }).Where(m => m.accuracy > 0m || m.f1Score > 0m).ToList();
+            _logger.LogInformation("Serving {Count} canonical models", canonicalModels.Count);
+            return Ok(ApiResponse<object>.Ok(canonicalModels));
+        }
+
+        var dbItems = models
+            .Select(BuildDbModelSummary)
+            .Where(model => model.Accuracy > 0m || model.F1Score > 0m)
+            .ToList();
 
         if (dbItems.Any())
         {
@@ -520,11 +530,15 @@ public class MlPredictionController : ControllerBase
     [AllowAnonymous]
     public async Task<IActionResult> GetTrainingStatus()
     {
-        var activeModel = await _db.MlModels
+        var models = await _db.MlModels
             .AsNoTracking()
+            .OrderByDescending(model => model.CreatedAt)
+            .ToListAsync();
+
+        var activeModel = models
             .Where(model => model.IsActive)
             .OrderByDescending(model => model.CreatedAt)
-            .FirstOrDefaultAsync();
+            .FirstOrDefault();
 
         var latestJob = await _db.MlTrainingJobs
             .AsNoTracking()
@@ -532,7 +546,11 @@ public class MlPredictionController : ControllerBase
             .OrderByDescending(job => job.StartedAt ?? job.FinishedAt)
             .FirstOrDefaultAsync();
 
-        var response = BuildTrainingStatusResponse(latestJob, activeModel);
+        var canonicalModels = BuildCanonicalModelSummaries(models);
+        var activeModelSummary = canonicalModels.FirstOrDefault(model => string.Equals(model.Status, "Active", StringComparison.OrdinalIgnoreCase))
+            ?? canonicalModels.FirstOrDefault();
+
+        var response = BuildTrainingStatusResponse(latestJob, activeModel, activeModelSummary);
         return Ok(ApiResponse<object>.Ok(response));
     }
 
@@ -963,6 +981,148 @@ public class MlPredictionController : ControllerBase
         string? ArtifactPath,
         List<RemoteModelMetrics>? ModelMetrics);
 
+    private static string NormalizeModelKey(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        return new string(value
+            .Trim()
+            .ToLowerInvariant()
+            .Where(char.IsLetterOrDigit)
+            .ToArray());
+    }
+
+    private static ModelSummaryResponse BuildDbModelSummary(MlModel model)
+    {
+        var accuracy = ParseMetric(model.MetricsJson, "accuracy");
+        var precision = ParseMetric(model.MetricsJson, "precision");
+        var recall = ParseMetric(model.MetricsJson, "recall");
+        var f1Score = ParseMetric(model.MetricsJson, "f1Score");
+        var rocAuc = ParseMetric(model.MetricsJson, "rocAuc");
+        var cvRocAucMean = ParseMetric(model.MetricsJson, "cvRocAucMean");
+        var testAccuracy = ParseMetric(model.MetricsJson, "testAccuracy");
+        var testPrecision = ParseMetric(model.MetricsJson, "testPrecision");
+        var testRecall = ParseMetric(model.MetricsJson, "testRecall");
+        var testF1 = ParseMetric(model.MetricsJson, "testF1");
+        var testRocAuc = ParseMetric(model.MetricsJson, "testRocAuc");
+
+        return new ModelSummaryResponse(
+            Id: model.Id,
+            Name: model.Name,
+            Version: model.Version,
+            DisplayLabel: $"{model.Name} · {model.Version}",
+            Accuracy: accuracy,
+            Precision: precision,
+            Recall: recall,
+            F1Score: f1Score,
+            RocAuc: rocAuc,
+            CvRocAucMean: cvRocAucMean,
+            TestAccuracy: testAccuracy,
+            TestPrecision: testPrecision,
+            TestRecall: testRecall,
+            TestF1: testF1,
+            TestRocAuc: testRocAuc,
+            IsBestModel: model.IsActive,
+            Status: model.IsActive ? "Active" : "Archived",
+            LastTrainedAt: model.CreatedAt);
+    }
+
+    private List<ModelSummaryResponse> BuildCanonicalModelSummaries(IReadOnlyList<MlModel> databaseModels)
+    {
+        if (TryBuildArtifactModelSummaries(out var artifactModels))
+        {
+            var mergedModels = MergeArtifactModelsWithDatabase(databaseModels, artifactModels);
+            if (mergedModels.Count > 0)
+            {
+                return mergedModels;
+            }
+        }
+
+        return databaseModels
+            .Select(BuildDbModelSummary)
+            .Where(model => model.Accuracy > 0m || model.F1Score > 0m)
+            .ToList();
+    }
+
+    private List<ModelSummaryResponse> MergeArtifactModelsWithDatabase(IReadOnlyList<MlModel> databaseModels, IReadOnlyList<ModelSummaryResponse> artifactModels)
+    {
+        var newestDatabaseModelsByName = databaseModels
+            .Where(model => !string.IsNullOrWhiteSpace(model.Name))
+            .OrderByDescending(model => model.CreatedAt)
+            .GroupBy(model => NormalizeModelKey(model.Name), StringComparer.OrdinalIgnoreCase)
+            .Where(group => !string.IsNullOrWhiteSpace(group.Key))
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
+
+        var activeModelKeys = newestDatabaseModelsByName.Values
+            .Where(model => model.IsActive)
+            .Select(model => NormalizeModelKey(model.Name))
+            .Where(key => !string.IsNullOrWhiteSpace(key))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var trustDatabaseActiveState = activeModelKeys.Count == 1;
+        var mergedModels = new List<ModelSummaryResponse>(artifactModels.Count);
+
+        foreach (var artifactModel in artifactModels)
+        {
+            var key = NormalizeModelKey(artifactModel.Name);
+            newestDatabaseModelsByName.TryGetValue(key, out var databaseModel);
+
+            var resolvedVersion = string.IsNullOrWhiteSpace(databaseModel?.Version)
+                ? artifactModel.Version
+                : databaseModel.Version;
+            var isActive = trustDatabaseActiveState
+                ? activeModelKeys.Contains(key)
+                : artifactModel.IsBestModel;
+            var resolvedDisplayLabel = string.Equals(resolvedVersion, artifactModel.Version, StringComparison.Ordinal)
+                ? artifactModel.DisplayLabel
+                : $"{artifactModel.Name} · {resolvedVersion}";
+
+            mergedModels.Add(artifactModel with
+            {
+                Id = databaseModel?.Id ?? artifactModel.Id,
+                Version = resolvedVersion,
+                DisplayLabel = resolvedDisplayLabel,
+                IsBestModel = isActive,
+                Status = isActive ? "Active" : "Archived",
+                LastTrainedAt = artifactModel.LastTrainedAt == default
+                    ? databaseModel?.CreatedAt ?? artifactModel.LastTrainedAt
+                    : artifactModel.LastTrainedAt,
+            });
+        }
+
+        var mergedKeys = mergedModels
+            .Select(model => NormalizeModelKey(model.Name))
+            .Where(key => !string.IsNullOrWhiteSpace(key))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var databaseModel in newestDatabaseModelsByName.Values)
+        {
+            var key = NormalizeModelKey(databaseModel.Name);
+            if (mergedKeys.Contains(key))
+            {
+                continue;
+            }
+
+            var modelSummary = BuildDbModelSummary(databaseModel);
+            if (modelSummary.Accuracy <= 0m && modelSummary.F1Score <= 0m)
+            {
+                continue;
+            }
+
+            mergedModels.Add(modelSummary);
+        }
+
+        return mergedModels
+            .OrderByDescending(model => model.F1Score)
+            .ThenByDescending(model => model.RocAuc)
+            .ThenByDescending(model => model.Accuracy)
+            .ThenBy(model => model.Name)
+            .ToList();
+    }
+
     private async Task<MlServiceTrainingResult> PostMlServiceTrainingAsync(string modelName, string datasetName, Dictionary<string, object>? parameters)
     {
         if (!await _mlServiceCoordinator.EnsureReadyAsync(requireLoadedModels: false))
@@ -1060,7 +1220,19 @@ public class MlPredictionController : ControllerBase
 
     private bool TryBuildModelsFromArtifacts(out List<object> models)
     {
+        if (TryBuildArtifactModelSummaries(out var typedModels))
+        {
+            models = typedModels.Cast<object>().ToList();
+            return true;
+        }
+
         models = new List<object>();
+        return false;
+    }
+
+    private bool TryBuildArtifactModelSummaries(out List<ModelSummaryResponse> models)
+    {
+        models = new List<ModelSummaryResponse>();
 
         var resultsPath = FindMlArtifactPath("propertytax_model_selection_results.csv");
 
@@ -1211,27 +1383,25 @@ public class MlPredictionController : ControllerBase
                 _logger.LogInformation("Row {RowIdx} parsed - Model: {ModelName}, Acc: {Acc}, Prec: {Prec}, Rec: {Rec}, F1: {F1}, RocAuc: {RocAuc}, isBest: {IsBest}",
                     i + 1, modelName, row.Accuracy, row.Precision, row.Recall, row.F1Score, row.RocAuc, isBestModel);
 
-                models.Add(new
-                {
-                    id = i + 1,
-                    name = modelName,
-                    version,
-                    displayLabel,
-                    accuracy = row.Accuracy,
-                    precision = row.Precision,
-                    recall = row.Recall,
-                    f1Score = row.F1Score,
-                    rocAuc = row.RocAuc,
-                    cvRocAucMean,
-                    testAccuracy = row.Accuracy,
-                    testPrecision = row.Precision,
-                    testRecall = row.Recall,
-                    testF1 = row.F1Score,
-                    testRocAuc = row.RocAuc,
-                    isBestModel,
-                    status = isBestModel ? "Active" : "Archived",
-                    lastTrainedAt = trainedAt,
-                });
+                models.Add(new ModelSummaryResponse(
+                    Id: i + 1,
+                    Name: modelName,
+                    Version: version,
+                    DisplayLabel: displayLabel,
+                    Accuracy: row.Accuracy,
+                    Precision: row.Precision,
+                    Recall: row.Recall,
+                    F1Score: row.F1Score,
+                    RocAuc: row.RocAuc,
+                    CvRocAucMean: cvRocAucMean,
+                    TestAccuracy: row.Accuracy,
+                    TestPrecision: row.Precision,
+                    TestRecall: row.Recall,
+                    TestF1: row.F1Score,
+                    TestRocAuc: row.RocAuc,
+                    IsBestModel: isBestModel,
+                    Status: isBestModel ? "Active" : "Archived",
+                    LastTrainedAt: trainedAt));
             }
 
             return models.Count > 0;
@@ -1239,7 +1409,7 @@ public class MlPredictionController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "Exception in TryBuildModelsFromArtifacts while reading CSV artifacts.");
-            models = new List<object>();
+            models = new List<ModelSummaryResponse>();
             return false;
         }
     }
@@ -1376,15 +1546,16 @@ public class MlPredictionController : ControllerBase
         return 0m;
     }
 
-    private TrainingStatusResponse BuildTrainingStatusResponse(MlTrainingJob? job, MlModel? activeModel)
+    private TrainingStatusResponse BuildTrainingStatusResponse(MlTrainingJob? job, MlModel? activeModel, ModelSummaryResponse? activeModelSummary)
     {
         var modelName = job?.Model?.Name
+            ?? activeModelSummary?.Name
             ?? activeModel?.Name
             ?? "N/A";
 
         var jobStatus = (job?.Status ?? string.Empty).Trim();
         var normalizedStatus = jobStatus.Length == 0 ? "idle" : jobStatus.ToLowerInvariant();
-        var lastTrainedAt = job?.FinishedAt ?? activeModel?.CreatedAt ?? job?.StartedAt;
+        var lastTrainedAt = job?.FinishedAt ?? activeModelSummary?.LastTrainedAt ?? activeModel?.CreatedAt ?? job?.StartedAt;
 
         var progress = normalizedStatus switch
         {
@@ -1405,11 +1576,11 @@ public class MlPredictionController : ControllerBase
             Progress = progress,
             CurrentModel = modelName,
             LastTrainedAt = lastTrainedAt,
-            Accuracy = activeModel is null ? 0m : ParseMetric(activeModel.MetricsJson, "accuracy"),
-            Precision = activeModel is null ? 0m : ParseMetric(activeModel.MetricsJson, "precision"),
-            Recall = activeModel is null ? 0m : ParseMetric(activeModel.MetricsJson, "recall"),
-            F1Score = activeModel is null ? 0m : ParseMetric(activeModel.MetricsJson, "f1Score"),
-            RocAuc = activeModel is null ? 0m : ParseMetric(activeModel.MetricsJson, "rocAuc"),
+            Accuracy = activeModelSummary?.Accuracy ?? (activeModel is null ? 0m : ParseMetric(activeModel.MetricsJson, "accuracy")),
+            Precision = activeModelSummary?.Precision ?? (activeModel is null ? 0m : ParseMetric(activeModel.MetricsJson, "precision")),
+            Recall = activeModelSummary?.Recall ?? (activeModel is null ? 0m : ParseMetric(activeModel.MetricsJson, "recall")),
+            F1Score = activeModelSummary?.F1Score ?? (activeModel is null ? 0m : ParseMetric(activeModel.MetricsJson, "f1Score")),
+            RocAuc = activeModelSummary?.RocAuc ?? (activeModel is null ? 0m : ParseMetric(activeModel.MetricsJson, "rocAuc")),
             JobId = job?.Id,
             Message = job?.Logs,
         };
@@ -1572,7 +1743,9 @@ public class MlPredictionController : ControllerBase
                         }
                     }
 
-                    if (root.TryGetProperty("modelMetrics", out var modelMetricsElement) && modelMetricsElement.ValueKind == JsonValueKind.Array)
+                    if (root.TryGetProperty("modelMetrics", out var modelMetricsElement)
+                        && modelMetricsElement.ValueKind == JsonValueKind.Array
+                        && modelMetricsElement.GetArrayLength() > 0)
                     {
                         foreach (var item in modelMetricsElement.EnumerateArray())
                         {
