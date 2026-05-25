@@ -33,6 +33,8 @@ public class MlPredictionController : ControllerBase
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static long _chartCacheGeneration = 1;
+    private const int MlBatchPredictionSize = 200;
+    private static readonly string[] ProbabilityHistogramBins = ["0-20%", "21-40%", "41-60%", "61-80%", "81-100%"];
 
     public MlPredictionController(
         IMlPredictionService predictionService,
@@ -91,6 +93,25 @@ public class MlPredictionController : ControllerBase
     {
         public List<string> Bins { get; set; } = new();
         public List<int> Counts { get; set; } = new();
+    }
+
+    private sealed class BatchPredictionResponse
+    {
+        public List<BatchPredictionItem> Predictions { get; set; } = new();
+    }
+
+    private sealed class BatchPredictionItem
+    {
+        public decimal Probability { get; set; }
+    }
+
+    private sealed class DatasetPredictionSummary
+    {
+        public int Low { get; set; }
+        public int Medium { get; set; }
+        public int High { get; set; }
+        public int TotalPredictions { get; set; }
+        public List<int> HistogramCounts { get; set; } = [0, 0, 0, 0, 0];
     }
 
     private sealed class TrainingStatusResponse
@@ -454,9 +475,15 @@ public class MlPredictionController : ControllerBase
     [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant + "," + SystemRoles.Staff)]
     public Task<IActionResult> GetRiskDistributionChart([FromQuery] string? dataset, [FromQuery(Name = "model_name")] string? modelName)
     {
+        var ttl = string.IsNullOrWhiteSpace(dataset) ? TimeSpan.FromMinutes(5) : TimeSpan.FromSeconds(30);
+
+        if (!string.IsNullOrWhiteSpace(dataset))
+        {
+            return GetRiskDistributionChartFromDatasetAsync(dataset, modelName, ttl);
+        }
+
         var cacheKey = BuildChartCacheKey("chart_risk_distribution", dataset, modelName);
         var relativePath = BuildChartRelativePath("chart/risk-distribution", dataset, modelName);
-        var ttl = string.IsNullOrWhiteSpace(dataset) ? TimeSpan.FromMinutes(5) : TimeSpan.FromSeconds(30);
         return GetChartFromMlServiceAsync<RiskDistributionChartResponse>(cacheKey: cacheKey, relativePath: relativePath, ttl: ttl);
     }
 
@@ -464,9 +491,15 @@ public class MlPredictionController : ControllerBase
     [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant + "," + SystemRoles.Staff)]
     public Task<IActionResult> GetProbabilityHistogramChart([FromQuery] string? dataset, [FromQuery(Name = "model_name")] string? modelName)
     {
+        var ttl = string.IsNullOrWhiteSpace(dataset) ? TimeSpan.FromMinutes(5) : TimeSpan.FromSeconds(30);
+
+        if (!string.IsNullOrWhiteSpace(dataset))
+        {
+            return GetProbabilityHistogramChartFromDatasetAsync(dataset, modelName, ttl);
+        }
+
         var cacheKey = BuildChartCacheKey("chart_probability_histogram", dataset, modelName);
         var relativePath = BuildChartRelativePath("chart/probability-histogram", dataset, modelName);
-        var ttl = string.IsNullOrWhiteSpace(dataset) ? TimeSpan.FromMinutes(5) : TimeSpan.FromSeconds(30);
         return GetChartFromMlServiceAsync<ProbabilityHistogramChartResponse>(cacheKey: cacheKey, relativePath: relativePath, ttl: ttl);
     }
 
@@ -884,6 +917,276 @@ public class MlPredictionController : ControllerBase
         {
             return StatusCode(503, new { error = "ML service unavailable" });
         }
+    }
+
+    private async Task<IActionResult> GetRiskDistributionChartFromDatasetAsync(string dataset, string? modelName, TimeSpan ttl)
+    {
+        try
+        {
+            var summary = await GetDatasetPredictionSummaryAsync(dataset, modelName, ttl);
+            return Ok(new RiskDistributionChartResponse
+            {
+                Low = summary.Low,
+                Medium = summary.Medium,
+                High = summary.High,
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to build risk distribution chart for dataset {Dataset} and model {ModelName}.", dataset, modelName ?? "(default)");
+            return StatusCode(503, new { error = "ML service unavailable" });
+        }
+    }
+
+    private async Task<IActionResult> GetProbabilityHistogramChartFromDatasetAsync(string dataset, string? modelName, TimeSpan ttl)
+    {
+        try
+        {
+            var summary = await GetDatasetPredictionSummaryAsync(dataset, modelName, ttl);
+            return Ok(new ProbabilityHistogramChartResponse
+            {
+                Bins = ProbabilityHistogramBins.ToList(),
+                Counts = summary.HistogramCounts.ToList(),
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to build probability histogram chart for dataset {Dataset} and model {ModelName}.", dataset, modelName ?? "(default)");
+            return StatusCode(503, new { error = "ML service unavailable" });
+        }
+    }
+
+    private async Task<DatasetPredictionSummary> GetDatasetPredictionSummaryAsync(string dataset, string? modelName, TimeSpan ttl)
+    {
+        var cacheKey = BuildChartCacheKey("chart_dataset_summary", dataset, modelName);
+        if (_memoryCache.TryGetValue(cacheKey, out DatasetPredictionSummary? cached) && cached is not null)
+        {
+            return cached;
+        }
+
+        var datasetPath = ResolveUploadedDatasetPath(dataset);
+        if (datasetPath is null)
+        {
+            throw new FileNotFoundException($"Dataset '{dataset}' was not found in backend uploads.");
+        }
+
+        if (!await _mlServiceCoordinator.EnsureReadyAsync(requireLoadedModels: true))
+        {
+            throw new InvalidOperationException("ML service unavailable.");
+        }
+
+        var mlServiceUrl = ResolveMlServiceBaseUrl();
+        if (string.IsNullOrWhiteSpace(mlServiceUrl))
+        {
+            throw new InvalidOperationException("ML service unavailable.");
+        }
+
+        var client = _httpClientFactory.CreateClient(nameof(MlPredictionController));
+        client.BaseAddress = new Uri(mlServiceUrl);
+        client.Timeout = TimeSpan.FromMinutes(2);
+
+        var summary = new DatasetPredictionSummary();
+        var batch = new List<Dictionary<string, object?>>(MlBatchPredictionSize);
+
+        await using var stream = System.IO.File.OpenRead(datasetPath);
+        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        var headerLine = await reader.ReadLineAsync();
+        if (string.IsNullOrWhiteSpace(headerLine))
+        {
+            throw new InvalidOperationException("Dataset is empty.");
+        }
+
+        var headers = ParseCsvLine(headerLine);
+        if (headers.Count == 0)
+        {
+            throw new InvalidOperationException("Dataset does not contain headers.");
+        }
+
+        while (await reader.ReadLineAsync() is { } line)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            var values = ParseCsvLine(line);
+            var instance = BuildPredictionInstance(headers, values);
+            if (instance.Count == 0)
+            {
+                continue;
+            }
+
+            batch.Add(instance);
+            if (batch.Count >= MlBatchPredictionSize)
+            {
+                await AppendPredictionSummaryAsync(summary, client, modelName, batch);
+                batch.Clear();
+            }
+        }
+
+        if (batch.Count > 0)
+        {
+            await AppendPredictionSummaryAsync(summary, client, modelName, batch);
+        }
+
+        if (summary.TotalPredictions == 0)
+        {
+            throw new InvalidOperationException("Dataset did not yield any rows for chart generation.");
+        }
+
+        _memoryCache.Set(cacheKey, summary, ttl);
+        return summary;
+    }
+
+    private async Task AppendPredictionSummaryAsync(
+        DatasetPredictionSummary summary,
+        HttpClient client,
+        string? modelName,
+        IReadOnlyList<Dictionary<string, object?>> batch)
+    {
+        var body = new
+        {
+            model = string.IsNullOrWhiteSpace(modelName) ? null : modelName,
+            instances = batch,
+        };
+
+        using var content = new StringContent(JsonSerializer.Serialize(body, JsonOptions), Encoding.UTF8, "application/json");
+        using var response = await client.PostAsync("predict/batch", content);
+        var payload = await response.Content.ReadAsStringAsync();
+
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException($"ML service batch prediction failed with status code {response.StatusCode}. Response: {payload}");
+        }
+
+        var parsed = JsonSerializer.Deserialize<BatchPredictionResponse>(payload, JsonOptions);
+        if (parsed?.Predictions is null || parsed.Predictions.Count == 0)
+        {
+            throw new InvalidOperationException("ML service batch prediction returned no predictions.");
+        }
+
+        foreach (var prediction in parsed.Predictions)
+        {
+            var probability = prediction.Probability;
+            summary.TotalPredictions += 1;
+
+            if (probability < 0.3m)
+            {
+                summary.Low += 1;
+            }
+            else if (probability <= 0.6m)
+            {
+                summary.Medium += 1;
+            }
+            else
+            {
+                summary.High += 1;
+            }
+
+            if (probability <= 0.2m)
+            {
+                summary.HistogramCounts[0] += 1;
+            }
+            else if (probability <= 0.4m)
+            {
+                summary.HistogramCounts[1] += 1;
+            }
+            else if (probability <= 0.6m)
+            {
+                summary.HistogramCounts[2] += 1;
+            }
+            else if (probability <= 0.8m)
+            {
+                summary.HistogramCounts[3] += 1;
+            }
+            else
+            {
+                summary.HistogramCounts[4] += 1;
+            }
+        }
+    }
+
+    private string? ResolveUploadedDatasetPath(string dataset)
+    {
+        if (string.IsNullOrWhiteSpace(dataset))
+        {
+            return null;
+        }
+
+        var uploadsRoot = Path.Combine(AppContext.BaseDirectory, "uploads", "ml-datasets");
+        if (!Directory.Exists(uploadsRoot))
+        {
+            return null;
+        }
+
+        var normalized = Path.GetFileName(dataset.Trim());
+        if (string.IsNullOrWhiteSpace(normalized) || normalized.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+        {
+            return null;
+        }
+
+        var directMatch = Path.Combine(uploadsRoot, normalized);
+        if (System.IO.File.Exists(directMatch))
+        {
+            return directMatch;
+        }
+
+        return Directory.GetFiles(uploadsRoot)
+            .OrderByDescending(path => new FileInfo(path).CreationTimeUtc)
+            .FirstOrDefault(path =>
+            {
+                var storedAs = Path.GetFileName(path);
+                var originalName = storedAs.Contains('_') ? storedAs.Split('_', 2)[1] : storedAs;
+
+                return string.Equals(storedAs, normalized, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(originalName, normalized, StringComparison.OrdinalIgnoreCase);
+            });
+    }
+
+    private static Dictionary<string, object?> BuildPredictionInstance(IReadOnlyList<string> headers, IReadOnlyList<string> values)
+    {
+        var instance = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+
+        for (var index = 0; index < headers.Count; index += 1)
+        {
+            var header = (headers[index] ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(header))
+            {
+                continue;
+            }
+
+            var raw = index < values.Count ? values[index] : string.Empty;
+            instance[header] = ParseCsvCellValue(raw);
+        }
+
+        return instance;
+    }
+
+    private static object? ParseCsvCellValue(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        var trimmed = raw.Trim();
+        if (bool.TryParse(trimmed, out var boolValue))
+        {
+            return boolValue;
+        }
+
+        if (long.TryParse(trimmed, NumberStyles.Integer, CultureInfo.InvariantCulture, out var longValue))
+        {
+            return longValue;
+        }
+
+        var numericCandidate = trimmed.Replace(",", string.Empty);
+        if (decimal.TryParse(numericCandidate, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var decimalValue))
+        {
+            return decimalValue;
+        }
+
+        return trimmed;
     }
 
     private static string BuildChartRelativePath(string path, string? dataset = null, string? modelName = null)

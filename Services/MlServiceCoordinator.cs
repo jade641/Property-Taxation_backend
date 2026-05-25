@@ -49,9 +49,30 @@ public sealed class MlServiceCoordinator : IHostedService, IMlServiceCoordinator
             return true;
         }
 
-        if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var serviceUri) || !IsLoopbackUri(serviceUri))
+        if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var serviceUri))
         {
             return false;
+        }
+
+        if (!IsLoopbackUri(serviceUri))
+        {
+            if (initialState == MlServiceState.HealthyNoModels)
+            {
+                try
+                {
+                    await PostReloadAsync(baseUrl, cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to reload remote ML service at {BaseUrl}. Continuing to wait for readiness.", baseUrl);
+                }
+            }
+
+            var remoteWaitTimeout = requireLoadedModels
+                ? TimeSpan.FromSeconds(60)
+                : TimeSpan.FromSeconds(30);
+
+            return await WaitForReadyStateAsync(baseUrl, requireLoadedModels, remoteWaitTimeout, cancellationToken);
         }
 
         await _gate.WaitAsync(cancellationToken);
