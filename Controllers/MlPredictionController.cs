@@ -33,7 +33,7 @@ public class MlPredictionController : ControllerBase
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static long _chartCacheGeneration = 1;
-    private const int MlBatchPredictionSize = 200;
+    private const int MlBatchPredictionSize = 1000;
     private static readonly string[] ProbabilityHistogramBins = ["0-20%", "21-40%", "41-60%", "61-80%", "81-100%"];
 
     public MlPredictionController(
@@ -878,13 +878,13 @@ public class MlPredictionController : ControllerBase
 
         if (!await _mlServiceCoordinator.EnsureReadyAsync(requireLoadedModels: true))
         {
-            return StatusCode(503, new { error = "ML service unavailable" });
+            return Ok(new { unavailable = true });
         }
 
         var mlServiceUrl = ResolveMlServiceBaseUrl();
         if (string.IsNullOrWhiteSpace(mlServiceUrl))
         {
-            return StatusCode(503, new { error = "ML service unavailable" });
+            return Ok(new { unavailable = true });
         }
 
         var client = _httpClientFactory.CreateClient(nameof(MlPredictionController));
@@ -897,12 +897,12 @@ public class MlPredictionController : ControllerBase
         }
         catch
         {
-            return StatusCode(503, new { error = "ML service unavailable" });
+            return Ok(new { unavailable = true });
         }
 
         if (!response.IsSuccessStatusCode)
         {
-            return StatusCode(503, new { error = "ML service unavailable" });
+            return Ok(new { unavailable = true });
         }
 
         try
@@ -912,7 +912,7 @@ public class MlPredictionController : ControllerBase
 
             if (parsed is null)
             {
-                return StatusCode(503, new { error = "ML service unavailable" });
+                return Ok(new { unavailable = true });
             }
 
             _memoryCache.Set(cacheKey, parsed, ttl ?? TimeSpan.FromMinutes(5));
@@ -920,7 +920,7 @@ public class MlPredictionController : ControllerBase
         }
         catch
         {
-            return StatusCode(503, new { error = "ML service unavailable" });
+            return Ok(new { unavailable = true });
         }
     }
 
@@ -939,7 +939,7 @@ public class MlPredictionController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to build risk distribution chart for dataset {Dataset} and model {ModelName}.", dataset, modelName ?? "(default)");
-            return StatusCode(503, new { error = "ML service unavailable" });
+            return Ok(new { unavailable = true });
         }
     }
 
@@ -957,7 +957,7 @@ public class MlPredictionController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to build probability histogram chart for dataset {Dataset} and model {ModelName}.", dataset, modelName ?? "(default)");
-            return StatusCode(503, new { error = "ML service unavailable" });
+            return Ok(new { unavailable = true });
         }
     }
 
@@ -988,7 +988,7 @@ public class MlPredictionController : ControllerBase
 
         var client = _httpClientFactory.CreateClient(nameof(MlPredictionController));
         client.BaseAddress = new Uri(mlServiceUrl);
-        client.Timeout = TimeSpan.FromMinutes(2);
+        client.Timeout = TimeSpan.FromMinutes(5);
 
         var summary = new DatasetPredictionSummary();
         var batch = new List<Dictionary<string, object?>>(MlBatchPredictionSize);
