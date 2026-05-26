@@ -2,6 +2,7 @@ using System.Text;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using PropertyTax.API.Models;
+using PropertyTax.API.Services;
 
 namespace PropertyTax.API.Data;
 
@@ -912,7 +913,10 @@ public class SampleDataSeeder
 
     private void EnsureSampleDocumentFile(string relativePath)
     {
-        var physicalPath = Path.Combine(_environment.ContentRootPath, relativePath.Replace('/', Path.DirectorySeparatorChar));
+        var physicalPath = FileStoragePathResolver.ResolveStoredFilePath(
+            _environment.ContentRootPath,
+            _configuration,
+            relativePath);
         var directory = Path.GetDirectoryName(physicalPath);
 
         if (!string.IsNullOrWhiteSpace(directory))
@@ -935,7 +939,10 @@ public class SampleDataSeeder
 
         try
         {
-            var physicalPath = Path.Combine(_environment.ContentRootPath, relativePath.Replace('/', Path.DirectorySeparatorChar));
+            var physicalPath = FileStoragePathResolver.ResolveStoredFilePath(
+                _environment.ContentRootPath,
+                _configuration,
+                relativePath);
 
             if (File.Exists(physicalPath))
             {

@@ -68,8 +68,7 @@ public class FilingController : ControllerBase
             ? "Property Documents"
             : uploadDto.Folder.Trim();
 
-        var uploadRoot = _configuration["FileStorage:UploadRoot"] ?? "uploads";
-        var uploadRootPath = Path.GetFullPath(Path.Combine(_webHostEnvironment.ContentRootPath, uploadRoot));
+        var uploadRootPath = FileStoragePathResolver.ResolveUploadRootPath(_webHostEnvironment.ContentRootPath, _configuration);
         var propertyFolder = Path.GetFullPath(Path.Combine(uploadRootPath, "properties", propertyId.ToString()));
 
         if (!propertyFolder.StartsWith(uploadRootPath, StringComparison.OrdinalIgnoreCase))
@@ -95,7 +94,7 @@ public class FilingController : ControllerBase
             PropertyId = property.Id,
             FileName = fileName,
             OriginalFileName = originalName,
-            RelativePath = Path.Combine(uploadRoot, "properties", propertyId.ToString(), fileName).Replace('\\', '/'),
+            RelativePath = FileStoragePathResolver.ResolveStoredRelativePath(_configuration, "properties", propertyId.ToString(), fileName),
             ContentType = AllowedContentTypes[extension],
             SizeInBytes = file.Length,
             Folder = folder,
@@ -159,7 +158,10 @@ public class FilingController : ControllerBase
             return NotFound(ApiResponse<object?>.Fail("Document not found."));
         }
 
-        var physicalPath = Path.Combine(_webHostEnvironment.ContentRootPath, document.RelativePath.Replace('/', Path.DirectorySeparatorChar));
+        var physicalPath = FileStoragePathResolver.ResolveStoredFilePath(
+            _webHostEnvironment.ContentRootPath,
+            _configuration,
+            document.RelativePath);
 
         if (System.IO.File.Exists(physicalPath))
         {

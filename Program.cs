@@ -1,4 +1,5 @@
 using System.Data.Common;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -56,8 +57,8 @@ var allowAnyOrigin = builder.Configuration.GetValue(
 var maxUploadBytes = long.TryParse(builder.Configuration["FileStorage:MaxUploadBytes"], out var configuredMaxUploadBytes)
     ? configuredMaxUploadBytes
     : 10 * 1024 * 1024;
-var uploadRootPath = ResolveUploadRootPath(builder.Environment.ContentRootPath, builder.Configuration["FileStorage:UploadRoot"]);
-var dataProtectionKeyPath = ResolveDataProtectionKeyPath(
+var uploadRootPath = FileStoragePathResolver.ResolveUploadRootPath(builder.Environment.ContentRootPath, builder.Configuration);
+var dataProtectionKeyPath = FileStoragePathResolver.ResolveDataProtectionKeyPath(
     builder.Environment.ContentRootPath,
     builder.Configuration["DataProtection:KeyPath"],
     uploadRootPath);
@@ -72,6 +73,12 @@ var startupConnectionTimeoutSeconds = int.TryParse(
     out var configuredStartupTimeoutSeconds)
     ? Math.Clamp(configuredStartupTimeoutSeconds, 5, 300)
     : 60;
+
+ValidateRuntimeSafety(
+    builder.Environment,
+    builder.Configuration,
+    configuredConnectionString,
+    runInitializationOnStartup);
 
 Directory.CreateDirectory(uploadRootPath);
 Directory.CreateDirectory(dataProtectionKeyPath);
@@ -555,45 +562,6 @@ static bool IsAllowedFrontendOrigin(string origin, string[] configuredOrigins)
         || host.EndsWith(".vercel.app", StringComparison.OrdinalIgnoreCase);
 }
 
-static string ResolveUploadRootPath(string contentRootPath, string? configuredUploadRoot)
-{
-    if (!string.IsNullOrWhiteSpace(configuredUploadRoot))
-    {
-        return ResolvePath(contentRootPath, configuredUploadRoot);
-    }
-
-    if (Directory.Exists("/var/data"))
-    {
-        return "/var/data/uploads";
-    }
-
-    var uploadRoot = "uploads";
-
-    return Path.GetFullPath(Path.Combine(contentRootPath, uploadRoot));
-}
-
-static string ResolveDataProtectionKeyPath(string contentRootPath, string? configuredKeyPath, string uploadRootPath)
-{
-    if (!string.IsNullOrWhiteSpace(configuredKeyPath))
-    {
-        return ResolvePath(contentRootPath, configuredKeyPath);
-    }
-
-    if (Directory.Exists("/var/data"))
-    {
-        return "/var/data/data-protection-keys";
-    }
-
-    return Path.GetFullPath(Path.Combine(uploadRootPath, ".keys"));
-}
-
-static string ResolvePath(string contentRootPath, string configuredPath)
-{
-    return Path.IsPathRooted(configuredPath)
-        ? Path.GetFullPath(configuredPath)
-        : Path.GetFullPath(Path.Combine(contentRootPath, configuredPath));
-}
-
 static IEnumerable<string> ParseDelimitedValues(params string?[] candidates)
 {
     foreach (var candidate in candidates)
@@ -611,6 +579,99 @@ static IEnumerable<string> ParseDelimitedValues(params string?[] candidates)
             }
         }
     }
+}
+
+static void ValidateRuntimeSafety(
+    IHostEnvironment environment,
+    IConfiguration configuration,
+    string configuredConnectionString,
+    bool runInitializationOnStartup)
+{
+    if (!environment.IsDevelopment() && runInitializationOnStartup)
+    {
+        throw new InvalidOperationException(
+            "Database:RunInitializationOnStartup must remain false outside development. Apply migrations and seed changes explicitly during deployment.");
+    }
+
+    var allowRemoteDevelopmentDatabase = configuration.GetValue("Database:AllowRemoteDevelopmentDatabase", false);
+    if (environment.IsDevelopment()
+        && !allowRemoteDevelopmentDatabase
+        && !IsSafeDevelopmentDatabaseConnection(configuredConnectionString))
+    {
+        throw new InvalidOperationException(
+            "Development configuration points to a non-local database. Use a local/dev database or set Database:AllowRemoteDevelopmentDatabase=true to override temporarily.");
+    }
+
+    if (!environment.IsDevelopment())
+    {
+        var mlServiceUrl = configuration["MlService:BaseUrl"]
+            ?? configuration["MlServiceUrl"]
+            ?? Environment.GetEnvironmentVariable("ML_SERVICE_URL");
+
+        if (string.IsNullOrWhiteSpace(mlServiceUrl))
+        {
+            throw new InvalidOperationException(
+                "MlServiceUrl or ML_SERVICE_URL must be configured outside development so deploys cannot silently run without the ML service.");
+        }
+    }
+}
+
+static bool IsSafeDevelopmentDatabaseConnection(string configuredConnectionString)
+{
+    try
+    {
+        var normalizedConnectionString = NormalizeMySqlConnectionString(configuredConnectionString);
+        var connectionStringBuilder = new MySqlConnectionStringBuilder(normalizedConnectionString);
+        var server = connectionStringBuilder.Server?.Trim();
+
+        if (string.IsNullOrWhiteSpace(server))
+        {
+            return false;
+        }
+
+        if (server.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+            || server.Equals("127.0.0.1", StringComparison.OrdinalIgnoreCase)
+            || server.Equals("::1", StringComparison.OrdinalIgnoreCase)
+            || server.Equals("host.docker.internal", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (!server.Contains('.', StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (IPAddress.TryParse(server, out var address))
+        {
+            return IPAddress.IsLoopback(address) || IsPrivateNetworkAddress(address);
+        }
+
+        return false;
+    }
+    catch
+    {
+        return false;
+    }
+}
+
+static bool IsPrivateNetworkAddress(IPAddress address)
+{
+    if (address.AddressFamily == AddressFamily.InterNetwork)
+    {
+        var bytes = address.GetAddressBytes();
+        return bytes[0] == 10
+            || (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31)
+            || (bytes[0] == 192 && bytes[1] == 168);
+    }
+
+    if (address.AddressFamily == AddressFamily.InterNetworkV6)
+    {
+        var bytes = address.GetAddressBytes();
+        return address.IsIPv6LinkLocal || (bytes[0] & 0xFE) == 0xFC;
+    }
+
+    return false;
 }
 
 static int? ResolveListenPort(IConfiguration configuration)

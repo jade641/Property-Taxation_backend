@@ -1,5 +1,7 @@
 using System.Globalization;
+using System.Net;
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -34,7 +36,10 @@ public class MlPredictionController : ControllerBase
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static long _chartCacheGeneration = 1;
     private const int MlBatchPredictionSize = 1000;
+    private const int DatasetPredictionPreviewLimit = 100;
     private static readonly string[] ProbabilityHistogramBins = ["0-20%", "21-40%", "41-60%", "61-80%", "81-100%"];
+    private const decimal MediumRiskThreshold = 0.5m;
+    private const decimal HighRiskThreshold = 0.8m;
 
     public MlPredictionController(
         IMlPredictionService predictionService,
@@ -102,6 +107,7 @@ public class MlPredictionController : ControllerBase
 
     private sealed class BatchPredictionItem
     {
+        public int? Prediction { get; set; }
         public decimal Probability { get; set; }
     }
 
@@ -111,8 +117,80 @@ public class MlPredictionController : ControllerBase
         public int Medium { get; set; }
         public int High { get; set; }
         public int TotalPredictions { get; set; }
+        public int LabeledPredictions { get; set; }
+        public int TruePositives { get; set; }
+        public int TrueNegatives { get; set; }
+        public int FalsePositives { get; set; }
+        public int FalseNegatives { get; set; }
         public List<int> HistogramCounts { get; set; } = [0, 0, 0, 0, 0];
+        public List<double> LabeledProbabilities { get; set; } = [];
+        public List<int> ActualLabels { get; set; } = [];
     }
+
+    private sealed class DatasetInsightsResponse
+    {
+        public int Low { get; set; }
+        public int Medium { get; set; }
+        public int High { get; set; }
+        public int TotalPredictions { get; set; }
+        public bool HasGroundTruth { get; set; }
+        public int EvaluatedRows { get; set; }
+        public decimal Accuracy { get; set; }
+        public decimal Precision { get; set; }
+        public decimal Recall { get; set; }
+        public decimal F1Score { get; set; }
+        public decimal RocAuc { get; set; }
+        public List<string> Bins { get; set; } = [];
+        public List<int> HistogramCounts { get; set; } = [];
+    }
+
+    private sealed class DatasetPredictionPreviewItem
+    {
+        public int RowNumber { get; set; }
+        public string PropertyId { get; set; } = string.Empty;
+        public string Owner { get; set; } = string.Empty;
+        public string Prediction { get; set; } = string.Empty;
+        public string RiskLevel { get; set; } = string.Empty;
+        public decimal ProbabilityScore { get; set; }
+        public string ModelName { get; set; } = string.Empty;
+    }
+
+    private sealed class DatasetAnalysisResult
+    {
+        public DatasetPredictionSummary Summary { get; set; } = new();
+        public List<DatasetPredictionPreviewItem> Predictions { get; set; } = [];
+        public int SkippedRows { get; set; }
+    }
+
+    private sealed class DatasetAnalysisResponse
+    {
+        public DatasetInsightsResponse? Summary { get; set; }
+        public List<DatasetPredictionPreviewItem> Predictions { get; set; } = [];
+        public int SkippedRows { get; set; }
+    }
+
+    private sealed class ArtifactManifestEntry
+    {
+        public string Name { get; set; } = string.Empty;
+        public string RelativePath { get; set; } = string.Empty;
+        public string Source { get; set; } = string.Empty;
+        public long SizeBytes { get; set; }
+        public DateTime LastModifiedUtc { get; set; }
+        public string Sha256 { get; set; } = string.Empty;
+    }
+
+    private sealed class BackendArtifactManifestResponse
+    {
+        public DateTime GeneratedAtUtc { get; set; }
+        public string? MlDirectory { get; set; }
+        public string? BundledArtifactsDirectory { get; set; }
+        public List<ArtifactManifestEntry> Artifacts { get; set; } = [];
+    }
+
+    private sealed record DatasetPredictionPreviewSeed(
+        int RowNumber,
+        string PropertyId,
+        string Owner);
 
     private sealed record RemoteTrainingDatasetPayload(
         string Dataset,
@@ -196,8 +274,8 @@ public class MlPredictionController : ControllerBase
             owner = prediction.Property?.Taxpayer?.FullName
                 ?? prediction.Property?.Pin
                 ?? prediction.PropertyId.ToString(),
-            prediction = prediction.PredictedLabel ? "Late" : "On-time",
-            riskLevel = prediction.Probability >= 0.8m ? "High" : prediction.Probability >= 0.5m ? "Medium" : "Low",
+            prediction = ToPredictionLabel(prediction.PredictedLabel ? 1 : 0, prediction.Probability),
+            riskLevel = GetRiskLevel(prediction.Probability),
             probabilityScore = Math.Round(prediction.Probability * 100m, 1),
             lastPaymentDate = prediction.Property?.Payments
                 .OrderByDescending(payment => payment.PaymentDateUtc)
@@ -508,6 +586,53 @@ public class MlPredictionController : ControllerBase
         return GetChartFromMlServiceAsync<ProbabilityHistogramChartResponse>(cacheKey: cacheKey, relativePath: relativePath, ttl: ttl);
     }
 
+    [HttpGet("dataset-insights")]
+    [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant + "," + SystemRoles.Staff)]
+    public async Task<IActionResult> GetDatasetInsights([FromQuery] string? dataset, [FromQuery(Name = "model_name")] string? modelName)
+    {
+        if (string.IsNullOrWhiteSpace(dataset))
+        {
+            return Ok(new { unavailable = true });
+        }
+
+        try
+        {
+            var summary = await GetDatasetPredictionSummaryAsync(dataset, modelName, TimeSpan.FromSeconds(30));
+            return Ok(BuildDatasetInsightsResponse(summary));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to build dataset insights for dataset {Dataset} and model {ModelName}.", dataset, modelName ?? "(default)");
+            return Ok(new { unavailable = true });
+        }
+    }
+
+    [HttpGet("dataset-analysis")]
+    [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant + "," + SystemRoles.Staff)]
+    public async Task<IActionResult> GetDatasetAnalysis([FromQuery] string? dataset, [FromQuery(Name = "model_name")] string? modelName)
+    {
+        if (string.IsNullOrWhiteSpace(dataset))
+        {
+            return Ok(ApiResponse<object>.Ok(new DatasetAnalysisResponse()));
+        }
+
+        try
+        {
+            var analysis = await GetDatasetAnalysisAsync(dataset, modelName, TimeSpan.FromSeconds(30));
+            return Ok(ApiResponse<object>.Ok(new DatasetAnalysisResponse
+            {
+                Summary = BuildDatasetInsightsResponse(analysis.Summary),
+                Predictions = analysis.Predictions,
+                SkippedRows = analysis.SkippedRows,
+            }));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to build dataset analysis for dataset {Dataset} and model {ModelName}.", dataset, modelName ?? "(default)");
+            return Ok(ApiResponse<object>.Ok(new DatasetAnalysisResponse()));
+        }
+    }
+
     [HttpPost("chart/cache/clear")]
     [Authorize(Roles = SystemRoles.Admin)]
     public IActionResult ClearChartCache()
@@ -592,6 +717,27 @@ public class MlPredictionController : ControllerBase
         return Ok(ApiResponse<object>.Ok(response));
     }
 
+    [HttpGet("artifacts/manifest")]
+    [AllowAnonymous]
+    public async Task<IActionResult> GetArtifactsManifest()
+    {
+        var mlServiceUrl = ResolveMlServiceBaseUrl();
+        JsonElement? mlServiceManifest = null;
+
+        if (!string.IsNullOrWhiteSpace(mlServiceUrl))
+        {
+            mlServiceManifest = await TryFetchMlServiceArtifactManifestAsync(mlServiceUrl);
+        }
+
+        return Ok(ApiResponse<object>.Ok(new
+        {
+            generatedAtUtc = DateTime.UtcNow,
+            backend = BuildBackendArtifactManifest(),
+            mlServiceUrl,
+            mlService = mlServiceManifest,
+        }));
+    }
+
     [HttpPost("training")]
     [Authorize(Roles = SystemRoles.Admin)]
     public async Task<IActionResult> QueueTraining([FromBody] TrainingRequest request)
@@ -654,7 +800,7 @@ public class MlPredictionController : ControllerBase
             return BadRequest(ApiResponse<object?>.Fail("Uploaded dataset is empty."));
         }
 
-        var uploadsRoot = Path.Combine(AppContext.BaseDirectory, "uploads", "ml-datasets");
+        var uploadsRoot = ResolveMlDatasetUploadsRoot();
         Directory.CreateDirectory(uploadsRoot);
 
         var safeFileName = $"{DateTime.UtcNow:yyyyMMddHHmmssfff}_{Path.GetFileName(file.FileName)}";
@@ -744,7 +890,7 @@ public class MlPredictionController : ControllerBase
     [Authorize(Roles = SystemRoles.Admin)]
     public IActionResult ListUploadedDatasets()
     {
-        var uploadsRoot = Path.Combine(AppContext.BaseDirectory, "uploads", "ml-datasets");
+        var uploadsRoot = ResolveMlDatasetUploadsRoot();
         if (!Directory.Exists(uploadsRoot)) return Ok(ApiResponse<object>.Ok(new object[0]));
 
         var files = Directory.GetFiles(uploadsRoot)
@@ -769,7 +915,7 @@ public class MlPredictionController : ControllerBase
             return BadRequest(ApiResponse<object?>.Fail("Invalid file name."));
         }
 
-        var uploadsRoot = Path.Combine(AppContext.BaseDirectory, "uploads", "ml-datasets");
+        var uploadsRoot = ResolveMlDatasetUploadsRoot();
         var targetPath = Path.Combine(uploadsRoot, storedFileName);
 
         var fullTarget = Path.GetFullPath(targetPath);
@@ -817,8 +963,8 @@ public class MlPredictionController : ControllerBase
             owner = prediction.Property?.Taxpayer?.FullName
                 ?? prediction.Property?.Pin
                 ?? prediction.PropertyId.ToString(),
-            prediction = prediction.PredictedLabel ? "Late" : "On-time",
-            riskLevel = prediction.Probability >= 0.8m ? "High" : prediction.Probability >= 0.5m ? "Medium" : "Low",
+            prediction = ToPredictionLabel(prediction.PredictedLabel ? 1 : 0, prediction.Probability),
+            riskLevel = GetRiskLevel(prediction.Probability),
             probabilityScore = Math.Round(prediction.Probability * 100m, 1),
             lastPaymentDate = prediction.Property?.Payments
                 .OrderByDescending(payment => payment.PaymentDateUtc)
@@ -851,12 +997,33 @@ public class MlPredictionController : ControllerBase
     {
         if (predictedLabel)
         {
-            return probability >= 0.8m
+            return probability >= HighRiskThreshold
                 ? "This property is flagged as high risk because the prediction score is elevated."
                 : "This property is flagged for review because the prediction score is above the threshold.";
         }
 
         return "This property is currently predicted to remain on time based on the latest signals.";
+    }
+
+    private static string GetRiskLevel(decimal probability)
+    {
+        if (probability >= HighRiskThreshold)
+        {
+            return "High";
+        }
+
+        if (probability >= MediumRiskThreshold)
+        {
+            return "Medium";
+        }
+
+        return "Low";
+    }
+
+    private static string ToPredictionLabel(int? predictedLabel, decimal probability)
+    {
+        var resolvedLabel = predictedLabel ?? (probability >= MediumRiskThreshold ? 1 : 0);
+        return resolvedLabel == 1 ? "Late" : "On-time";
     }
 
     private static object[] BuildFactors(decimal probability)
@@ -963,8 +1130,14 @@ public class MlPredictionController : ControllerBase
 
     private async Task<DatasetPredictionSummary> GetDatasetPredictionSummaryAsync(string dataset, string? modelName, TimeSpan ttl)
     {
-        var cacheKey = BuildChartCacheKey("chart_dataset_summary", dataset, modelName);
-        if (_memoryCache.TryGetValue(cacheKey, out DatasetPredictionSummary? cached) && cached is not null)
+        var analysis = await GetDatasetAnalysisAsync(dataset, modelName, ttl);
+        return analysis.Summary;
+    }
+
+    private async Task<DatasetAnalysisResult> GetDatasetAnalysisAsync(string dataset, string? modelName, TimeSpan ttl)
+    {
+        var cacheKey = BuildChartCacheKey("chart_dataset_analysis", dataset, modelName);
+        if (_memoryCache.TryGetValue(cacheKey, out DatasetAnalysisResult? cached) && cached is not null)
         {
             return cached;
         }
@@ -975,27 +1148,36 @@ public class MlPredictionController : ControllerBase
             throw new FileNotFoundException($"Dataset '{dataset}' was not found in backend uploads.");
         }
 
-        if (!await _mlServiceCoordinator.EnsureReadyAsync(requireLoadedModels: true))
-        {
-            throw new InvalidOperationException("ML service unavailable.");
-        }
-
         var mlServiceUrl = ResolveMlServiceBaseUrl();
         if (string.IsNullOrWhiteSpace(mlServiceUrl))
         {
             throw new InvalidOperationException("ML service unavailable.");
         }
 
+        var isRemoteMlService = IsRemoteMlServiceBaseUrl(mlServiceUrl);
+        if (!isRemoteMlService && !await _mlServiceCoordinator.EnsureReadyAsync(requireLoadedModels: true))
+        {
+            throw new InvalidOperationException("ML service unavailable.");
+        }
+
+        if (isRemoteMlService)
+        {
+            _ = await _mlServiceCoordinator.EnsureReadyAsync(requireLoadedModels: true);
+        }
+
         var client = _httpClientFactory.CreateClient(nameof(MlPredictionController));
         client.BaseAddress = new Uri(mlServiceUrl);
         client.Timeout = TimeSpan.FromMinutes(5);
 
-        var summary = new DatasetPredictionSummary();
+        var analysis = new DatasetAnalysisResult();
         var batch = new List<Dictionary<string, object?>>(MlBatchPredictionSize);
+        var batchLabels = new List<int?>(MlBatchPredictionSize);
+        var batchPreviewSeeds = new List<DatasetPredictionPreviewSeed>(MlBatchPredictionSize);
+        var rowNumber = 0;
 
         await using var stream = System.IO.File.OpenRead(datasetPath);
         using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-        var headerLine = await reader.ReadLineAsync();
+        var headerLine = await ReadCsvRecordAsync(reader);
         if (string.IsNullOrWhiteSpace(headerLine))
         {
             throw new InvalidOperationException("Dataset is empty.");
@@ -1007,13 +1189,16 @@ public class MlPredictionController : ControllerBase
             throw new InvalidOperationException("Dataset does not contain headers.");
         }
 
-        while (await reader.ReadLineAsync() is { } line)
+        var groundTruthLabelIndex = FindGroundTruthLabelIndex(headers);
+
+        while (await ReadCsvRecordAsync(reader) is { } line)
         {
             if (string.IsNullOrWhiteSpace(line))
             {
                 continue;
             }
 
+            rowNumber += 1;
             var values = ParseCsvLine(line);
             var instance = BuildPredictionInstance(headers, values);
             if (instance.Count == 0)
@@ -1022,32 +1207,163 @@ public class MlPredictionController : ControllerBase
             }
 
             batch.Add(instance);
+            batchLabels.Add(TryParseGroundTruthLabel(values, groundTruthLabelIndex, out var label) ? label : null);
+            batchPreviewSeeds.Add(BuildDatasetPredictionPreviewSeed(headers, values, rowNumber));
+
             if (batch.Count >= MlBatchPredictionSize)
             {
-                await AppendPredictionSummaryAsync(summary, client, modelName, batch);
+                await AppendPredictionSummaryAsync(analysis, client, modelName, batch, batchLabels, batchPreviewSeeds, isRemoteMlService ? 4 : 1);
                 batch.Clear();
+                batchLabels.Clear();
+                batchPreviewSeeds.Clear();
             }
         }
 
         if (batch.Count > 0)
         {
-            await AppendPredictionSummaryAsync(summary, client, modelName, batch);
+            await AppendPredictionSummaryAsync(analysis, client, modelName, batch, batchLabels, batchPreviewSeeds, isRemoteMlService ? 4 : 1);
         }
 
-        if (summary.TotalPredictions == 0)
+        if (analysis.Summary.TotalPredictions == 0)
         {
             throw new InvalidOperationException("Dataset did not yield any rows for chart generation.");
         }
 
-        _memoryCache.Set(cacheKey, summary, ttl);
-        return summary;
+        _memoryCache.Set(cacheKey, analysis, ttl);
+        return analysis;
     }
 
     private async Task AppendPredictionSummaryAsync(
-        DatasetPredictionSummary summary,
+        DatasetAnalysisResult analysis,
         HttpClient client,
         string? modelName,
-        IReadOnlyList<Dictionary<string, object?>> batch)
+        IReadOnlyList<Dictionary<string, object?>> batch,
+        IReadOnlyList<int?> labels,
+        IReadOnlyList<DatasetPredictionPreviewSeed> previewSeeds,
+        int requestAttempts)
+    {
+        var predictions = await RequestPredictionBatchWithFallbackAsync(client, modelName, batch, requestAttempts);
+
+        for (var index = 0; index < batch.Count; index += 1)
+        {
+            var prediction = index < predictions.Count ? predictions[index] : null;
+            if (prediction is null)
+            {
+                analysis.SkippedRows += 1;
+                continue;
+            }
+
+            var probability = prediction.Probability;
+            analysis.Summary.TotalPredictions += 1;
+
+            switch (GetRiskLevel(probability))
+            {
+                case "High":
+                    analysis.Summary.High += 1;
+                    break;
+                case "Medium":
+                    analysis.Summary.Medium += 1;
+                    break;
+                default:
+                    analysis.Summary.Low += 1;
+                    break;
+            }
+
+            if (probability <= 0.2m)
+            {
+                analysis.Summary.HistogramCounts[0] += 1;
+            }
+            else if (probability <= 0.4m)
+            {
+                analysis.Summary.HistogramCounts[1] += 1;
+            }
+            else if (probability <= 0.6m)
+            {
+                analysis.Summary.HistogramCounts[2] += 1;
+            }
+            else if (probability <= 0.8m)
+            {
+                analysis.Summary.HistogramCounts[3] += 1;
+            }
+            else
+            {
+                analysis.Summary.HistogramCounts[4] += 1;
+            }
+
+            var actualLabel = index < labels.Count ? labels[index] : null;
+            var previewSeed = index < previewSeeds.Count ? previewSeeds[index] : new DatasetPredictionPreviewSeed(index + 1, $"Row {index + 1}", "Unknown owner");
+
+            if (analysis.Predictions.Count < DatasetPredictionPreviewLimit)
+            {
+                analysis.Predictions.Add(new DatasetPredictionPreviewItem
+                {
+                    RowNumber = previewSeed.RowNumber,
+                    PropertyId = previewSeed.PropertyId,
+                    Owner = previewSeed.Owner,
+                    Prediction = ToPredictionLabel(prediction.Prediction, probability),
+                    RiskLevel = GetRiskLevel(probability),
+                    ProbabilityScore = Math.Round(probability * 100m, 1),
+                    ModelName = string.IsNullOrWhiteSpace(modelName) ? "Active model" : modelName,
+                });
+            }
+
+            if (actualLabel.HasValue)
+            {
+                var predictedLabel = prediction.Prediction ?? (probability >= MediumRiskThreshold ? 1 : 0);
+                analysis.Summary.LabeledPredictions += 1;
+                analysis.Summary.LabeledProbabilities.Add((double)probability);
+                analysis.Summary.ActualLabels.Add(actualLabel.Value);
+
+                if (predictedLabel == 1 && actualLabel.Value == 1)
+                {
+                    analysis.Summary.TruePositives += 1;
+                }
+                else if (predictedLabel == 0 && actualLabel.Value == 0)
+                {
+                    analysis.Summary.TrueNegatives += 1;
+                }
+                else if (predictedLabel == 1)
+                {
+                    analysis.Summary.FalsePositives += 1;
+                }
+                else
+                {
+                    analysis.Summary.FalseNegatives += 1;
+                }
+            }
+        }
+    }
+
+    private async Task<List<BatchPredictionItem?>> RequestPredictionBatchWithFallbackAsync(
+        HttpClient client,
+        string? modelName,
+        IReadOnlyList<Dictionary<string, object?>> batch,
+        int requestAttempts)
+    {
+        try
+        {
+            var predictions = await RequestBatchPredictionsAsync(client, modelName, batch, requestAttempts);
+            return predictions.Cast<BatchPredictionItem?>().ToList();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Batch prediction failed for {Count} dataset rows. Falling back to single-row predictions.", batch.Count);
+        }
+
+        var singlePredictions = new List<BatchPredictionItem?>(batch.Count);
+        foreach (var instance in batch)
+        {
+            singlePredictions.Add(await RequestSinglePredictionAsync(client, modelName, instance, 1));
+        }
+
+        return singlePredictions;
+    }
+
+    private async Task<List<BatchPredictionItem>> RequestBatchPredictionsAsync(
+        HttpClient client,
+        string? modelName,
+        IReadOnlyList<Dictionary<string, object?>> batch,
+        int requestAttempts)
     {
         var body = new
         {
@@ -1055,8 +1371,14 @@ public class MlPredictionController : ControllerBase
             instances = batch,
         };
 
-        using var content = new StringContent(JsonSerializer.Serialize(body, JsonOptions), Encoding.UTF8, "application/json");
-        using var response = await client.PostAsync("predict/batch", content);
+        using var response = await SendMlRequestWithRetryAsync(
+            async () =>
+            {
+                using var content = new StringContent(JsonSerializer.Serialize(body, JsonOptions), Encoding.UTF8, "application/json");
+                return await client.PostAsync("predict/batch", content);
+            },
+            "ML service batch prediction",
+            requestAttempts);
         var payload = await response.Content.ReadAsStringAsync();
 
         if (!response.IsSuccessStatusCode)
@@ -1070,45 +1392,308 @@ public class MlPredictionController : ControllerBase
             throw new InvalidOperationException("ML service batch prediction returned no predictions.");
         }
 
-        foreach (var prediction in parsed.Predictions)
+        if (parsed.Predictions.Count != batch.Count)
         {
-            var probability = prediction.Probability;
-            summary.TotalPredictions += 1;
+            throw new InvalidOperationException($"ML service batch prediction returned {parsed.Predictions.Count} predictions for {batch.Count} dataset rows.");
+        }
 
-            if (probability < 0.3m)
+        return parsed.Predictions;
+    }
+
+    private async Task<BatchPredictionItem?> RequestSinglePredictionAsync(
+        HttpClient client,
+        string? modelName,
+        IReadOnlyDictionary<string, object?> instance,
+        int requestAttempts)
+    {
+        var body = new
+        {
+            model = string.IsNullOrWhiteSpace(modelName) ? null : modelName,
+            features = instance,
+        };
+
+        try
+        {
+            using var response = await SendMlRequestWithRetryAsync(
+                async () =>
+                {
+                    using var content = new StringContent(JsonSerializer.Serialize(body, JsonOptions), Encoding.UTF8, "application/json");
+                    return await client.PostAsync("predict", content);
+                },
+                "ML service single prediction",
+                requestAttempts);
+            var payload = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
             {
-                summary.Low += 1;
+                _logger.LogWarning("Single-row prediction failed with status code {StatusCode}. Response: {Payload}", response.StatusCode, payload);
+                return null;
             }
-            else if (probability <= 0.6m)
+
+            using var document = JsonDocument.Parse(payload);
+            var root = document.RootElement;
+
+            decimal probability;
+            if (root.TryGetProperty("probability", out var probabilityProperty) && probabilityProperty.TryGetDecimal(out var decimalProbability))
             {
-                summary.Medium += 1;
+                probability = decimalProbability;
+            }
+            else if (root.TryGetProperty("probability", out probabilityProperty) && probabilityProperty.TryGetDouble(out var doubleProbability))
+            {
+                probability = (decimal)doubleProbability;
             }
             else
             {
-                summary.High += 1;
+                _logger.LogWarning("Single-row prediction response did not include a probability payload.");
+                return null;
             }
 
-            if (probability <= 0.2m)
+            var prediction = root.TryGetProperty("prediction", out var predictionProperty) && predictionProperty.TryGetInt32(out var predictedLabel)
+                ? predictedLabel
+                : (int?)null;
+
+            return new BatchPredictionItem
             {
-                summary.HistogramCounts[0] += 1;
-            }
-            else if (probability <= 0.4m)
+                Prediction = prediction,
+                Probability = probability,
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Single-row prediction fallback failed.");
+            return null;
+        }
+    }
+
+    private static DatasetInsightsResponse BuildDatasetInsightsResponse(DatasetPredictionSummary summary)
+    {
+        var evaluatedRows = summary.LabeledPredictions;
+        var accuracy = evaluatedRows == 0
+            ? 0m
+            : Math.Round((summary.TruePositives + summary.TrueNegatives) / (decimal)evaluatedRows, 4, MidpointRounding.AwayFromZero);
+
+        var predictedPositiveCount = summary.TruePositives + summary.FalsePositives;
+        var actualPositiveCount = summary.TruePositives + summary.FalseNegatives;
+        var precision = predictedPositiveCount == 0
+            ? 0m
+            : Math.Round(summary.TruePositives / (decimal)predictedPositiveCount, 4, MidpointRounding.AwayFromZero);
+        var recall = actualPositiveCount == 0
+            ? 0m
+            : Math.Round(summary.TruePositives / (decimal)actualPositiveCount, 4, MidpointRounding.AwayFromZero);
+        var f1Score = precision + recall == 0m
+            ? 0m
+            : Math.Round((2m * precision * recall) / (precision + recall), 4, MidpointRounding.AwayFromZero);
+
+        return new DatasetInsightsResponse
+        {
+            Low = summary.Low,
+            Medium = summary.Medium,
+            High = summary.High,
+            TotalPredictions = summary.TotalPredictions,
+            HasGroundTruth = evaluatedRows > 0,
+            EvaluatedRows = evaluatedRows,
+            Accuracy = accuracy,
+            Precision = precision,
+            Recall = recall,
+            F1Score = f1Score,
+            RocAuc = ComputeRocAuc(summary.LabeledProbabilities, summary.ActualLabels),
+            Bins = ProbabilityHistogramBins.ToList(),
+            HistogramCounts = summary.HistogramCounts.ToList(),
+        };
+    }
+
+    private static int FindGroundTruthLabelIndex(IReadOnlyList<string> headers)
+    {
+        var preferredNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "islatepayment",
+            "latepayment",
+            "target",
+            "label",
+            "actuallabel",
+            "actual",
+        };
+
+        for (var index = 0; index < headers.Count; index += 1)
+        {
+            var normalized = NormalizeHeaderToken(headers[index]);
+            if (preferredNames.Contains(normalized))
             {
-                summary.HistogramCounts[1] += 1;
-            }
-            else if (probability <= 0.6m)
-            {
-                summary.HistogramCounts[2] += 1;
-            }
-            else if (probability <= 0.8m)
-            {
-                summary.HistogramCounts[3] += 1;
-            }
-            else
-            {
-                summary.HistogramCounts[4] += 1;
+                return index;
             }
         }
+
+        return -1;
+    }
+
+    private static bool TryParseGroundTruthLabel(IReadOnlyList<string> values, int labelIndex, out int label)
+    {
+        label = 0;
+        if (labelIndex < 0 || labelIndex >= values.Count)
+        {
+            return false;
+        }
+
+        var raw = (values[labelIndex] ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return false;
+        }
+
+        if (bool.TryParse(raw, out var boolValue))
+        {
+            label = boolValue ? 1 : 0;
+            return true;
+        }
+
+        if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var intValue))
+        {
+            if (intValue is 0 or 1)
+            {
+                label = intValue;
+                return true;
+            }
+
+            return false;
+        }
+
+        var normalized = NormalizeHeaderToken(raw);
+        if (normalized is "late" or "latepayment" or "high" or "yes" or "true")
+        {
+            label = 1;
+            return true;
+        }
+
+        if (normalized is "ontime" or "ontimepayment" or "low" or "no" or "false")
+        {
+            label = 0;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static string NormalizeHeaderToken(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var buffer = new StringBuilder(value.Length);
+        foreach (var character in value)
+        {
+            if (char.IsLetterOrDigit(character))
+            {
+                buffer.Append(char.ToLowerInvariant(character));
+            }
+        }
+
+        return buffer.ToString();
+    }
+
+    private static decimal ComputeRocAuc(IReadOnlyList<double> probabilities, IReadOnlyList<int> actualLabels)
+    {
+        if (probabilities.Count == 0 || probabilities.Count != actualLabels.Count)
+        {
+            return 0m;
+        }
+
+        var positiveCount = actualLabels.Count(label => label == 1);
+        var negativeCount = actualLabels.Count - positiveCount;
+        if (positiveCount == 0 || negativeCount == 0)
+        {
+            return 0m;
+        }
+
+        var ranked = probabilities
+            .Select((probability, index) => new { Probability = probability, Label = actualLabels[index] })
+            .OrderBy(item => item.Probability)
+            .ToList();
+
+        double positiveRankSum = 0;
+        var currentIndex = 0;
+        while (currentIndex < ranked.Count)
+        {
+            var endIndex = currentIndex;
+            while (endIndex + 1 < ranked.Count && ranked[endIndex + 1].Probability.Equals(ranked[currentIndex].Probability))
+            {
+                endIndex += 1;
+            }
+
+            var averageRank = ((currentIndex + 1d) + (endIndex + 1d)) / 2d;
+            for (var rankIndex = currentIndex; rankIndex <= endIndex; rankIndex += 1)
+            {
+                if (ranked[rankIndex].Label == 1)
+                {
+                    positiveRankSum += averageRank;
+                }
+            }
+
+            currentIndex = endIndex + 1;
+        }
+
+        var auc = (positiveRankSum - (positiveCount * (positiveCount + 1d) / 2d)) / (positiveCount * negativeCount);
+        return Math.Round((decimal)auc, 4, MidpointRounding.AwayFromZero);
+    }
+
+    private async Task<HttpResponseMessage> SendMlRequestWithRetryAsync(
+        Func<Task<HttpResponseMessage>> sendAsync,
+        string operation,
+        int maxAttempts)
+    {
+        Exception? lastException = null;
+
+        for (var attempt = 1; attempt <= Math.Max(1, maxAttempts); attempt += 1)
+        {
+            try
+            {
+                var response = await sendAsync();
+                if (response.IsSuccessStatusCode || attempt >= maxAttempts || !ShouldRetryMlResponse(response.StatusCode))
+                {
+                    return response;
+                }
+
+                _logger.LogWarning("{Operation} attempt {Attempt}/{MaxAttempts} returned status {StatusCode}. Retrying remote ML request.", operation, attempt, maxAttempts, (int)response.StatusCode);
+                response.Dispose();
+            }
+            catch (Exception ex) when (attempt < maxAttempts)
+            {
+                lastException = ex;
+                _logger.LogWarning(ex, "{Operation} attempt {Attempt}/{MaxAttempts} failed. Retrying remote ML request.", operation, attempt, maxAttempts);
+            }
+
+            if (attempt < maxAttempts)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(Math.Min(5 * attempt, 15)));
+            }
+        }
+
+        throw new InvalidOperationException($"{operation} failed after {maxAttempts} attempts.", lastException);
+    }
+
+    private static bool ShouldRetryMlResponse(HttpStatusCode statusCode)
+    {
+        var numericCode = (int)statusCode;
+        return numericCode == 408 || numericCode == 425 || numericCode == 429 || numericCode >= 500;
+    }
+
+    private static bool IsRemoteMlServiceBaseUrl(string? mlServiceUrl)
+    {
+        if (string.IsNullOrWhiteSpace(mlServiceUrl) || !Uri.TryCreate(mlServiceUrl, UriKind.Absolute, out var uri))
+        {
+            return false;
+        }
+
+        if (uri.IsLoopback)
+        {
+            return false;
+        }
+
+        return !string.Equals(uri.Host, "localhost", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(uri.Host, "127.0.0.1", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(uri.Host, "::1", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(uri.Host, "0.0.0.0", StringComparison.OrdinalIgnoreCase);
     }
 
     private string? ResolveUploadedDatasetPath(string dataset)
@@ -1118,7 +1703,7 @@ public class MlPredictionController : ControllerBase
             return null;
         }
 
-        var uploadsRoot = Path.Combine(AppContext.BaseDirectory, "uploads", "ml-datasets");
+        var uploadsRoot = ResolveMlDatasetUploadsRoot();
         if (!Directory.Exists(uploadsRoot))
         {
             return null;
@@ -1165,6 +1750,52 @@ public class MlPredictionController : ControllerBase
         }
 
         return instance;
+    }
+
+    private static DatasetPredictionPreviewSeed BuildDatasetPredictionPreviewSeed(IReadOnlyList<string> headers, IReadOnlyList<string> values, int rowNumber)
+    {
+        var propertyId = GetCsvFieldValue(headers, values,
+            "property_id",
+            "pin",
+            "tax_declaration_no",
+            "record_id",
+            "lot_number");
+        var owner = GetCsvFieldValue(headers, values,
+            "owner_name",
+            "owner",
+            "taxpayer_name",
+            "taxpayer",
+            "full_name");
+
+        return new DatasetPredictionPreviewSeed(
+            RowNumber: rowNumber,
+            PropertyId: string.IsNullOrWhiteSpace(propertyId) ? $"Row {rowNumber}" : propertyId,
+            Owner: string.IsNullOrWhiteSpace(owner) ? "Unknown owner" : owner);
+    }
+
+    private static string GetCsvFieldValue(IReadOnlyList<string> headers, IReadOnlyList<string> values, params string[] candidateHeaders)
+    {
+        for (var headerIndex = 0; headerIndex < headers.Count; headerIndex += 1)
+        {
+            var normalizedHeader = NormalizeHeaderToken(headers[headerIndex]);
+            if (!candidateHeaders.Any(candidate => string.Equals(normalizedHeader, NormalizeHeaderToken(candidate), StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            if (headerIndex >= values.Count)
+            {
+                continue;
+            }
+
+            var value = values[headerIndex]?.Trim() ?? string.Empty;
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return value;
+            }
+        }
+
+        return string.Empty;
     }
 
     private static object? ParseCsvCellValue(string? raw)
@@ -1498,15 +2129,22 @@ public class MlPredictionController : ControllerBase
 
     private async Task<MlServiceTrainingResult> PostMlServiceTrainingAsync(string modelName, string datasetName, Dictionary<string, object>? parameters)
     {
-        if (!await _mlServiceCoordinator.EnsureReadyAsync(requireLoadedModels: false))
-        {
-            throw new InvalidOperationException("ML service is unavailable");
-        }
-
         var mlServiceUrl = ResolveMlServiceBaseUrl();
         if (string.IsNullOrWhiteSpace(mlServiceUrl))
         {
             throw new InvalidOperationException("ML service unavailable");
+        }
+
+        var isRemoteMlService = IsRemoteMlServiceBaseUrl(mlServiceUrl);
+        if (!isRemoteMlService && !await _mlServiceCoordinator.EnsureReadyAsync(requireLoadedModels: false))
+        {
+            throw new InvalidOperationException("ML service is unavailable");
+        }
+
+        if (isRemoteMlService)
+        {
+            // Best-effort warmup for remote services; the training POST below will retry while Render wakes the instance.
+            _ = await _mlServiceCoordinator.EnsureReadyAsync(requireLoadedModels: false);
         }
 
         var client = _httpClientFactory.CreateClient(nameof(MlPredictionController));
@@ -1524,11 +2162,17 @@ public class MlPredictionController : ControllerBase
             parameters,
         };
 
-        using var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
         HttpResponseMessage response;
         try
         {
-            response = await client.PostAsync("train", content);
+            response = await SendMlRequestWithRetryAsync(
+                async () =>
+                {
+                    using var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+                    return await client.PostAsync("train", content);
+                },
+                "ML service training request",
+                isRemoteMlService ? 4 : 1);
         }
         catch (Exception ex)
         {
@@ -1850,12 +2494,136 @@ public class MlPredictionController : ControllerBase
         return null;
     }
 
+    private string ResolveMlDatasetUploadsRoot()
+    {
+        return FileStoragePathResolver.ResolveMlDatasetUploadRootPath(_environment.ContentRootPath, _configuration);
+    }
+
     private string? FindSolutionRoot()
     {
         return MlPathResolver.ResolveSolutionRoot(
             _environment.ContentRootPath,
             AppContext.BaseDirectory,
             Directory.GetCurrentDirectory());
+    }
+
+    private BackendArtifactManifestResponse BuildBackendArtifactManifest()
+    {
+        var manifest = new BackendArtifactManifestResponse
+        {
+            GeneratedAtUtc = DateTime.UtcNow,
+            MlDirectory = FindMlDirectory(),
+        };
+
+        var bundledArtifactsDirectory = Path.Combine(AppContext.BaseDirectory, "MlArtifacts");
+        if (Directory.Exists(bundledArtifactsDirectory))
+        {
+            manifest.BundledArtifactsDirectory = bundledArtifactsDirectory;
+        }
+
+        var artifactEntries = new List<ArtifactManifestEntry>();
+        var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void AddManifestFile(string? filePath, string source, string? baseDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(filePath) || !System.IO.File.Exists(filePath))
+            {
+                return;
+            }
+
+            var normalizedPath = Path.GetFullPath(filePath);
+            if (!seenPaths.Add(normalizedPath))
+            {
+                return;
+            }
+
+            artifactEntries.Add(BuildArtifactManifestEntry(normalizedPath, source, baseDirectory));
+        }
+
+        var modelsDirectory = string.IsNullOrWhiteSpace(manifest.MlDirectory)
+            ? null
+            : Path.Combine(manifest.MlDirectory, "models");
+
+        if (!string.IsNullOrWhiteSpace(modelsDirectory) && Directory.Exists(modelsDirectory))
+        {
+            foreach (var modelPath in Directory.GetFiles(modelsDirectory, "*.pkl").OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+            {
+                AddManifestFile(modelPath, "ml-root", manifest.MlDirectory);
+            }
+
+            AddManifestFile(Path.Combine(modelsDirectory, "propertytax_feature_info.json"), "ml-root", manifest.MlDirectory);
+            AddManifestFile(Path.Combine(modelsDirectory, "propertytax_model_selection_results.csv"), "ml-root", manifest.MlDirectory);
+        }
+
+        AddManifestFile(FindMlArtifactPath("propertytax_feature_info.json"), "bundled-artifacts", bundledArtifactsDirectory);
+        AddManifestFile(FindMlArtifactPath("propertytax_model_selection_results.csv"), "bundled-artifacts", bundledArtifactsDirectory);
+
+        manifest.Artifacts = artifactEntries
+            .OrderBy(entry => entry.Source, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(entry => entry.RelativePath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return manifest;
+    }
+
+    private async Task<JsonElement?> TryFetchMlServiceArtifactManifestAsync(string mlServiceUrl)
+    {
+        try
+        {
+            var client = _httpClientFactory.CreateClient(nameof(MlPredictionController));
+            client.BaseAddress = new Uri(mlServiceUrl);
+            client.Timeout = TimeSpan.FromSeconds(30);
+
+            using var response = await client.GetAsync("artifacts/manifest");
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("ML service artifact manifest request returned status code {StatusCode} from {Url}", (int)response.StatusCode, mlServiceUrl);
+                return null;
+            }
+
+            var payload = await response.Content.ReadAsStringAsync();
+            return JsonSerializer.Deserialize<JsonElement>(payload, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch ML service artifact manifest from {Url}", mlServiceUrl);
+            return null;
+        }
+    }
+
+    private static ArtifactManifestEntry BuildArtifactManifestEntry(string fullPath, string source, string? baseDirectory)
+    {
+        var fileInfo = new FileInfo(fullPath);
+        var relativePath = Path.GetFileName(fullPath);
+
+        if (!string.IsNullOrWhiteSpace(baseDirectory))
+        {
+            try
+            {
+                relativePath = Path.GetRelativePath(baseDirectory, fullPath).Replace('\\', '/');
+            }
+            catch
+            {
+                relativePath = Path.GetFileName(fullPath);
+            }
+        }
+
+        return new ArtifactManifestEntry
+        {
+            Name = fileInfo.Name,
+            RelativePath = relativePath,
+            Source = source,
+            SizeBytes = fileInfo.Length,
+            LastModifiedUtc = fileInfo.LastWriteTimeUtc,
+            Sha256 = ComputeSha256(fullPath),
+        };
+    }
+
+    private static string ComputeSha256(string fullPath)
+    {
+        using var stream = System.IO.File.OpenRead(fullPath);
+        using var sha256 = SHA256.Create();
+        return Convert.ToHexString(sha256.ComputeHash(stream)).ToLowerInvariant();
     }
 
     private static string ReadBestModelName(string featureInfoPath)
@@ -1912,6 +2680,53 @@ public class MlPredictionController : ControllerBase
 
         values.Add(current.Trim());
         return values;
+    }
+
+    private static async Task<string?> ReadCsvRecordAsync(StreamReader reader)
+    {
+        var line = await reader.ReadLineAsync();
+        if (line is null)
+        {
+            return null;
+        }
+
+        var record = new StringBuilder(line);
+        while (!HasBalancedCsvQuotes(record.ToString()))
+        {
+            var continuation = await reader.ReadLineAsync();
+            if (continuation is null)
+            {
+                break;
+            }
+
+            record.Append('\n');
+            record.Append(continuation);
+        }
+
+        return record.ToString();
+    }
+
+    private static bool HasBalancedCsvQuotes(string value)
+    {
+        var inQuotes = false;
+
+        for (var index = 0; index < value.Length; index += 1)
+        {
+            if (value[index] != '"')
+            {
+                continue;
+            }
+
+            if (inQuotes && index + 1 < value.Length && value[index + 1] == '"')
+            {
+                index += 1;
+                continue;
+            }
+
+            inQuotes = !inQuotes;
+        }
+
+        return !inQuotes;
     }
 
     private static decimal ReadDecimal(IReadOnlyList<string> values, int index)
