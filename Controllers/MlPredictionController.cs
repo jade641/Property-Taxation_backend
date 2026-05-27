@@ -40,6 +40,9 @@ public class MlPredictionController : ControllerBase
     private static readonly string[] ProbabilityHistogramBins = ["0-20%", "21-40%", "41-60%", "61-80%", "81-100%"];
     private const decimal MediumRiskThreshold = 0.5m;
     private const decimal HighRiskThreshold = 0.8m;
+    private const string DatasetSummaryAlertTitle = "High-risk records detected";
+    private const string MlPredictionSourceTypeProperty = "Property";
+    private const string MlPredictionSourceTypeDatasetPreview = "DatasetPreview";
 
     public MlPredictionController(
         IMlPredictionService predictionService,
@@ -169,6 +172,10 @@ public class MlPredictionController : ControllerBase
         public int SkippedRows { get; set; }
     }
 
+    private sealed record ResolvedDatasetIdentity(
+        string DisplayName,
+        string StoredFileName);
+
     private sealed class ArtifactManifestEntry
     {
         public string Name { get; set; } = string.Empty;
@@ -259,6 +266,7 @@ public class MlPredictionController : ControllerBase
     {
         var predictions = await _db.MlPredictions
             .AsNoTracking()
+            .Where(prediction => prediction.SourceType == MlPredictionSourceTypeProperty || prediction.SourceType == null)
             .Include(prediction => prediction.Property)
                 .ThenInclude(property => property!.Taxpayer)
             .Include(prediction => prediction.Property)
@@ -270,10 +278,14 @@ public class MlPredictionController : ControllerBase
         var items = predictions.Select(prediction => new
         {
             id = prediction.Id,
-            propertyId = prediction.PropertyId,
-            owner = prediction.Property?.Taxpayer?.FullName
-                ?? prediction.Property?.Pin
-                ?? prediction.PropertyId.ToString(),
+            propertyId = !string.IsNullOrWhiteSpace(prediction.ExternalPropertyId)
+                ? prediction.ExternalPropertyId
+                : prediction.PropertyId?.ToString(CultureInfo.InvariantCulture),
+            owner = !string.IsNullOrWhiteSpace(prediction.OwnerSnapshot)
+                ? prediction.OwnerSnapshot
+                : prediction.Property?.Taxpayer?.FullName
+                    ?? prediction.Property?.Pin
+                    ?? (prediction.PropertyId?.ToString(CultureInfo.InvariantCulture) ?? "Unknown owner"),
             prediction = ToPredictionLabel(prediction.PredictedLabel ? 1 : 0, prediction.Probability),
             riskLevel = GetRiskLevel(prediction.Probability),
             probabilityScore = Math.Round(prediction.Probability * 100m, 1),
@@ -352,7 +364,10 @@ public class MlPredictionController : ControllerBase
 
     private object BuildAlertResponse(MlAlert alert)
     {
-        var propertyReference = alert.Property?.Pin ?? alert.PropertyId.ToString(CultureInfo.InvariantCulture);
+        var propertyReference = !string.IsNullOrWhiteSpace(alert.ReferenceId)
+            ? alert.ReferenceId
+            : alert.Property?.Pin
+                ?? (alert.PropertyId?.ToString(CultureInfo.InvariantCulture) ?? "ML module");
         var normalizedSeverity = NormalizeAlertSeverity(alert.Severity);
 
         return new
@@ -368,6 +383,65 @@ public class MlPredictionController : ControllerBase
             propertyId = propertyReference,
             severity = normalizedSeverity,
         };
+    }
+
+    private async Task SyncDatasetSummaryAlertAsync(string dataset, string? modelName, DatasetPredictionSummary summary)
+    {
+        var datasetLabel = System.IO.Path.GetFileName(dataset.Trim());
+        if (string.IsNullOrWhiteSpace(datasetLabel))
+        {
+            datasetLabel = dataset.Trim();
+        }
+
+        var normalizedModelName = string.IsNullOrWhiteSpace(modelName) ? "the active model" : modelName.Trim();
+        var description = $"{summary.High.ToString("N0", CultureInfo.InvariantCulture)} records from {datasetLabel} were classified as high risk by {normalizedModelName}.";
+
+        try
+        {
+            var existingOpenAlert = await _db.MlAlerts
+                .FirstOrDefaultAsync(alert => alert.PropertyId == null
+                    && alert.ReferenceId == datasetLabel
+                    && alert.Title == DatasetSummaryAlertTitle
+                    && alert.Status == "Open");
+
+            if (summary.High <= 0)
+            {
+                if (existingOpenAlert is not null)
+                {
+                    existingOpenAlert.Status = "Resolved";
+                    await _db.SaveChangesAsync();
+                }
+
+                return;
+            }
+
+            if (existingOpenAlert is null)
+            {
+                _db.MlAlerts.Add(new MlAlert
+                {
+                    PropertyId = null,
+                    ReferenceId = datasetLabel,
+                    Title = DatasetSummaryAlertTitle,
+                    Description = description,
+                    Severity = "High",
+                    Status = "Open",
+                    CreatedAt = DateTime.UtcNow,
+                });
+            }
+            else
+            {
+                existingOpenAlert.ReferenceId = datasetLabel;
+                existingOpenAlert.Description = description;
+                existingOpenAlert.Severity = "High";
+                existingOpenAlert.CreatedAt = DateTime.UtcNow;
+            }
+
+            await _db.SaveChangesAsync();
+        }
+        catch (Exception ex) when (IsMissingMlAlertsTableException(ex))
+        {
+            _logger.LogWarning(ex, "Skipping dataset ML alert persistence because the ml_alerts schema is not aligned yet.");
+        }
     }
 
     private static string NormalizeAlertSeverity(string? severity)
@@ -401,7 +475,15 @@ public class MlPredictionController : ControllerBase
             if (exception.Message.Contains("ml_alerts", StringComparison.OrdinalIgnoreCase)
                 && (exception.Message.Contains("doesn't exist", StringComparison.OrdinalIgnoreCase)
                     || exception.Message.Contains("does not exist", StringComparison.OrdinalIgnoreCase)
-                    || exception.Message.Contains("unknown table", StringComparison.OrdinalIgnoreCase)))
+                    || exception.Message.Contains("unknown table", StringComparison.OrdinalIgnoreCase)
+                    || exception.Message.Contains("unknown column", StringComparison.OrdinalIgnoreCase)
+                    || exception.Message.Contains("cannot be null", StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+
+            if (exception.Message.Contains("ReferenceId", StringComparison.OrdinalIgnoreCase)
+                && exception.Message.Contains("unknown column", StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }
@@ -461,10 +543,7 @@ public class MlPredictionController : ControllerBase
     [AllowAnonymous]
     public async Task<IActionResult> GetModels()
     {
-        var models = await _db.MlModels
-            .AsNoTracking()
-            .OrderByDescending(model => model.CreatedAt)
-            .ToListAsync();
+        var models = await LoadNormalizedMlModelsAsync();
 
         var canonicalModels = BuildCanonicalModelSummaries(models);
         if (canonicalModels.Count > 0)
@@ -619,10 +698,27 @@ public class MlPredictionController : ControllerBase
         try
         {
             var analysis = await GetDatasetAnalysisAsync(dataset, modelName, TimeSpan.FromSeconds(30));
+            await SyncDatasetSummaryAlertAsync(dataset, modelName, analysis.Summary);
+            var currentUserId = User?.Claims.FirstOrDefault(c => c.Type == System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+            var datasetIdentity = ResolveDatasetIdentity(dataset);
+            var resolvedModel = await ResolveDatasetPredictionModelAsync(modelName);
+            var persistedPredictions = analysis.Predictions;
+
+            if (resolvedModel is not null)
+            {
+                await SyncDatasetPreviewPredictionsAsync(datasetIdentity, resolvedModel, modelName, currentUserId, analysis.Predictions);
+
+                var storedPredictions = await LoadDatasetPreviewPredictionsAsync(datasetIdentity, resolvedModel, modelName);
+                if (storedPredictions.Count > 0)
+                {
+                    persistedPredictions = storedPredictions;
+                }
+            }
+
             return Ok(ApiResponse<object>.Ok(new DatasetAnalysisResponse
             {
                 Summary = BuildDatasetInsightsResponse(analysis.Summary),
-                Predictions = analysis.Predictions,
+                Predictions = persistedPredictions,
                 SkippedRows = analysis.SkippedRows,
             }));
         }
@@ -631,6 +727,208 @@ public class MlPredictionController : ControllerBase
             _logger.LogWarning(ex, "Failed to build dataset analysis for dataset {Dataset} and model {ModelName}.", dataset, modelName ?? "(default)");
             return Ok(ApiResponse<object>.Ok(new DatasetAnalysisResponse()));
         }
+    }
+
+    private ResolvedDatasetIdentity ResolveDatasetIdentity(string dataset)
+    {
+        var datasetPath = ResolveUploadedDatasetPath(dataset);
+        if (datasetPath is null)
+        {
+            throw new FileNotFoundException($"Dataset '{dataset}' was not found in backend uploads.");
+        }
+
+        var storedFileName = Path.GetFileName(datasetPath);
+        var displayName = storedFileName.Contains('_', StringComparison.Ordinal)
+            ? storedFileName.Split('_', 2)[1]
+            : storedFileName;
+
+        return new ResolvedDatasetIdentity(displayName, storedFileName);
+    }
+
+    private async Task<MlModel?> ResolveDatasetPredictionModelAsync(string? modelName)
+    {
+        var models = await LoadNormalizedMlModelsAsync();
+        if (models.Count == 0)
+        {
+            return null;
+        }
+
+        if (!string.IsNullOrWhiteSpace(modelName))
+        {
+            var namedModel = models
+                .OrderByDescending(model => model.IsActive)
+                .ThenByDescending(model => model.CreatedAt)
+                .FirstOrDefault(model => string.Equals(model.Name, modelName.Trim(), StringComparison.OrdinalIgnoreCase));
+
+            if (namedModel is not null)
+            {
+                return namedModel;
+            }
+        }
+
+        return models
+            .OrderByDescending(model => model.IsActive)
+            .ThenByDescending(model => model.CreatedAt)
+            .FirstOrDefault();
+    }
+
+    private async Task SyncDatasetPreviewPredictionsAsync(
+        ResolvedDatasetIdentity datasetIdentity,
+        MlModel model,
+        string? requestedModelName,
+        string? createdById,
+        IReadOnlyList<DatasetPredictionPreviewItem> previewPredictions)
+    {
+        try
+        {
+            var existingPredictions = await _db.MlPredictions
+                .Where(prediction => prediction.SourceType == MlPredictionSourceTypeDatasetPreview
+                    && prediction.ModelId == model.Id
+                    && prediction.DatasetStoredAs == datasetIdentity.StoredFileName)
+                .ToListAsync();
+
+            if (existingPredictions.Count > 0)
+            {
+                _db.MlPredictions.RemoveRange(existingPredictions);
+            }
+
+            var createdAt = DateTime.UtcNow;
+            var modelLabel = string.IsNullOrWhiteSpace(requestedModelName) ? "Active model" : model.Name;
+
+            foreach (var preview in previewPredictions)
+            {
+                var probability = Math.Clamp(preview.ProbabilityScore / 100m, 0m, 1m);
+
+                _db.MlPredictions.Add(new MlPrediction
+                {
+                    SourceType = MlPredictionSourceTypeDatasetPreview,
+                    DatasetName = datasetIdentity.DisplayName,
+                    DatasetStoredAs = datasetIdentity.StoredFileName,
+                    RowNumber = preview.RowNumber,
+                    ExternalPropertyId = preview.PropertyId,
+                    OwnerSnapshot = preview.Owner,
+                    PropertyId = null,
+                    ModelId = model.Id,
+                    Probability = probability,
+                    PredictedLabel = string.Equals(preview.Prediction, "Late", StringComparison.OrdinalIgnoreCase),
+                    ExplanationJson = JsonSerializer.Serialize(new
+                    {
+                        source = "dataset-analysis-preview",
+                        dataset = datasetIdentity.DisplayName,
+                        storedAs = datasetIdentity.StoredFileName,
+                        rowNumber = preview.RowNumber,
+                        propertyId = preview.PropertyId,
+                        owner = preview.Owner,
+                        prediction = preview.Prediction,
+                        riskLevel = preview.RiskLevel,
+                        modelName = modelLabel,
+                    }),
+                    CreatedById = createdById,
+                    CreatedAt = createdAt,
+                });
+            }
+
+            await _db.SaveChangesAsync();
+        }
+        catch (Exception ex) when (IsMissingMlPredictionsDatasetSchemaException(ex))
+        {
+            _logger.LogWarning(ex, "Skipping dataset preview prediction persistence because the ml_predictions schema is not aligned yet.");
+        }
+    }
+
+    private async Task<List<DatasetPredictionPreviewItem>> LoadDatasetPreviewPredictionsAsync(
+        ResolvedDatasetIdentity datasetIdentity,
+        MlModel model,
+        string? requestedModelName)
+    {
+        try
+        {
+            var modelLabel = string.IsNullOrWhiteSpace(requestedModelName) ? "Active model" : model.Name;
+
+            var baseQuery = _db.MlPredictions
+                .AsNoTracking()
+                .Where(prediction => prediction.SourceType == MlPredictionSourceTypeDatasetPreview
+                    && prediction.ModelId == model.Id);
+
+            var predictions = await baseQuery
+                .Where(prediction => prediction.DatasetStoredAs == datasetIdentity.StoredFileName)
+                .OrderBy(prediction => prediction.RowNumber ?? int.MaxValue)
+                .ThenBy(prediction => prediction.Id)
+                .ToListAsync();
+
+            if (predictions.Count == 0)
+            {
+                predictions = await baseQuery
+                    .Where(prediction => (prediction.DatasetStoredAs == null || prediction.DatasetStoredAs == string.Empty)
+                        && prediction.DatasetName == datasetIdentity.DisplayName)
+                    .OrderByDescending(prediction => prediction.CreatedAt)
+                    .ThenByDescending(prediction => prediction.Id)
+                    .ToListAsync();
+            }
+
+            predictions = predictions
+                .GroupBy(prediction => prediction.RowNumber ?? prediction.Id)
+                .Select(group => group
+                    .OrderByDescending(prediction => prediction.CreatedAt)
+                    .ThenByDescending(prediction => prediction.Id)
+                    .First())
+                .OrderBy(prediction => prediction.RowNumber ?? int.MaxValue)
+                .ThenBy(prediction => prediction.Id)
+                .ToList();
+
+            return predictions
+                .Select(prediction => new DatasetPredictionPreviewItem
+                {
+                    RowNumber = prediction.RowNumber ?? 0,
+                    PropertyId = !string.IsNullOrWhiteSpace(prediction.ExternalPropertyId)
+                        ? prediction.ExternalPropertyId
+                        : prediction.PropertyId?.ToString(CultureInfo.InvariantCulture) ?? $"Row {prediction.RowNumber ?? prediction.Id}",
+                    Owner = !string.IsNullOrWhiteSpace(prediction.OwnerSnapshot)
+                        ? prediction.OwnerSnapshot
+                        : "Unknown owner",
+                    Prediction = ToPredictionLabel(prediction.PredictedLabel ? 1 : 0, prediction.Probability),
+                    RiskLevel = GetRiskLevel(prediction.Probability),
+                    ProbabilityScore = Math.Round(prediction.Probability * 100m, 1),
+                    ModelName = modelLabel,
+                })
+                .ToList();
+        }
+        catch (Exception ex) when (IsMissingMlPredictionsDatasetSchemaException(ex))
+        {
+            _logger.LogWarning(ex, "Stored dataset preview predictions are unavailable because the ml_predictions schema is not aligned yet.");
+            return [];
+        }
+    }
+
+    private static bool IsMissingMlPredictionsDatasetSchemaException(Exception? exception)
+    {
+        while (exception is not null)
+        {
+            if (exception.Message.Contains("ml_predictions", StringComparison.OrdinalIgnoreCase)
+                && (exception.Message.Contains("doesn't exist", StringComparison.OrdinalIgnoreCase)
+                    || exception.Message.Contains("does not exist", StringComparison.OrdinalIgnoreCase)
+                    || exception.Message.Contains("unknown table", StringComparison.OrdinalIgnoreCase)
+                    || exception.Message.Contains("unknown column", StringComparison.OrdinalIgnoreCase)
+                    || exception.Message.Contains("cannot be null", StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+
+            if ((exception.Message.Contains("SourceType", StringComparison.OrdinalIgnoreCase)
+                    || exception.Message.Contains("DatasetName", StringComparison.OrdinalIgnoreCase)
+                    || exception.Message.Contains("DatasetStoredAs", StringComparison.OrdinalIgnoreCase)
+                    || exception.Message.Contains("RowNumber", StringComparison.OrdinalIgnoreCase)
+                    || exception.Message.Contains("ExternalPropertyId", StringComparison.OrdinalIgnoreCase)
+                    || exception.Message.Contains("OwnerSnapshot", StringComparison.OrdinalIgnoreCase))
+                && exception.Message.Contains("unknown column", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            exception = exception.InnerException;
+        }
+
+        return false;
     }
 
     [HttpPost("chart/cache/clear")]
@@ -693,10 +991,7 @@ public class MlPredictionController : ControllerBase
     [AllowAnonymous]
     public async Task<IActionResult> GetTrainingStatus()
     {
-        var models = await _db.MlModels
-            .AsNoTracking()
-            .OrderByDescending(model => model.CreatedAt)
-            .ToListAsync();
+        var models = await LoadNormalizedMlModelsAsync();
 
         var activeModel = models
             .Where(model => model.IsActive)
@@ -760,7 +1055,6 @@ public class MlPredictionController : ControllerBase
                 IsActive = false,
                 CreatedAt = DateTime.UtcNow,
             };
-
             _db.MlModels.Add(model);
             await _db.SaveChangesAsync();
         }
@@ -887,7 +1181,7 @@ public class MlPredictionController : ControllerBase
     }
 
     [HttpGet("datasets")]
-    [Authorize(Roles = SystemRoles.Admin)]
+    [Authorize(Roles = SystemRoles.Admin + "," + SystemRoles.Auditor + "," + SystemRoles.Accountant + "," + SystemRoles.Staff)]
     public IActionResult ListUploadedDatasets()
     {
         var uploadsRoot = ResolveMlDatasetUploadsRoot();
@@ -956,13 +1250,21 @@ public class MlPredictionController : ControllerBase
 
     private static object BuildPredictionResponse(MlPrediction prediction)
     {
+        var propertyReference = !string.IsNullOrWhiteSpace(prediction.ExternalPropertyId)
+            ? prediction.ExternalPropertyId
+            : prediction.Property?.Pin
+                ?? (prediction.PropertyId?.ToString(CultureInfo.InvariantCulture) ?? "N/A");
+        var ownerName = !string.IsNullOrWhiteSpace(prediction.OwnerSnapshot)
+            ? prediction.OwnerSnapshot
+            : prediction.Property?.Taxpayer?.FullName
+                ?? prediction.Property?.Pin
+                ?? (prediction.PropertyId?.ToString(CultureInfo.InvariantCulture) ?? "Unknown owner");
+
         return new
         {
             id = prediction.Id,
-            propertyId = prediction.PropertyId,
-            owner = prediction.Property?.Taxpayer?.FullName
-                ?? prediction.Property?.Pin
-                ?? prediction.PropertyId.ToString(),
+            propertyId = propertyReference,
+            owner = ownerName,
             prediction = ToPredictionLabel(prediction.PredictedLabel ? 1 : 0, prediction.Probability),
             riskLevel = GetRiskLevel(prediction.Probability),
             probabilityScore = Math.Round(prediction.Probability * 100m, 1),
@@ -2049,6 +2351,92 @@ public class MlPredictionController : ControllerBase
         }
 
         return dbModelSummaries;
+    }
+
+    private async Task<List<MlModel>> LoadNormalizedMlModelsAsync()
+    {
+        var models = await _db.MlModels
+            .AsNoTracking()
+            .OrderByDescending(model => model.CreatedAt)
+            .ToListAsync();
+
+        if (models.Count == 0)
+        {
+            return models;
+        }
+
+        var normalizedActiveModelId = ResolveNormalizedActiveModelId(models);
+        var activeModelIds = models
+            .Where(model => model.IsActive)
+            .Select(model => model.Id)
+            .OrderBy(id => id)
+            .ToArray();
+
+        if (normalizedActiveModelId is null)
+        {
+            return models;
+        }
+
+        if (activeModelIds.Length == 1 && activeModelIds[0] == normalizedActiveModelId.Value)
+        {
+            return models;
+        }
+
+        await _db.Database.ExecuteSqlInterpolatedAsync(
+            $@"UPDATE `ml_models`
+SET `IsActive` = CASE WHEN `Id` = {normalizedActiveModelId.Value} THEN TRUE ELSE FALSE END");
+
+        return await _db.MlModels
+            .AsNoTracking()
+            .OrderByDescending(model => model.CreatedAt)
+            .ToListAsync();
+    }
+
+    private int? ResolveNormalizedActiveModelId(IReadOnlyList<MlModel> databaseModels)
+    {
+        if (databaseModels.Count == 0)
+        {
+            return null;
+        }
+
+        var activeModels = databaseModels
+            .Where(model => model.IsActive)
+            .OrderByDescending(model => model.CreatedAt)
+            .ToList();
+
+        if (activeModels.Count == 1)
+        {
+            return activeModels[0].Id;
+        }
+
+        string? preferredModelKey = null;
+
+        if (TryBuildArtifactModelSummaries(out var artifactModels))
+        {
+            preferredModelKey = artifactModels
+                .Where(model => model.IsBestModel || string.Equals(model.Status, "Active", StringComparison.OrdinalIgnoreCase))
+                .Select(model => NormalizeModelKey(model.Name))
+                .FirstOrDefault(key => !string.IsNullOrWhiteSpace(key));
+        }
+
+        if (string.IsNullOrWhiteSpace(preferredModelKey))
+        {
+            preferredModelKey = BuildDatabaseModelSummaries(databaseModels)
+                .Select(model => NormalizeModelKey(model.Name))
+                .FirstOrDefault(key => !string.IsNullOrWhiteSpace(key));
+        }
+
+        var preferredModel = databaseModels
+            .Where(model => string.Equals(NormalizeModelKey(model.Name), preferredModelKey, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(model => model.CreatedAt)
+            .FirstOrDefault();
+
+        return preferredModel?.Id
+            ?? databaseModels
+                .OrderByDescending(model => model.IsActive)
+                .ThenByDescending(model => model.CreatedAt)
+                .First()
+                .Id;
     }
 
     private List<ModelSummaryResponse> MergeArtifactModelsWithDatabase(IReadOnlyList<MlModel> databaseModels, IReadOnlyList<ModelSummaryResponse> artifactModels)

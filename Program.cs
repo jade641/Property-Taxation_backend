@@ -40,7 +40,9 @@ var connectionString = CreateMySqlConnectionString(configuredConnectionString);
 var databaseServerVersion = ResolveDatabaseServerVersion(builder.Configuration);
 
 var jwtKey = builder.Configuration["Jwt:Key"]
-    ?? throw new InvalidOperationException("Missing JWT key.");
+    ?? Environment.GetEnvironmentVariable("JWT_KEY")
+    ?? Environment.GetEnvironmentVariable("JWT_SECRET")
+    ?? throw new InvalidOperationException("Missing JWT key. Set Jwt:Key, Jwt__Key, JWT_KEY, or JWT_SECRET.");
 
 if (Encoding.UTF8.GetByteCount(jwtKey) < 32)
 {
@@ -698,6 +700,8 @@ static string ResolveConnectionString(IConfiguration configuration)
         configuration.GetConnectionString("DefaultConnection"),
         configuration["ConnectionStrings:DefaultConnection"],
         configuration["DefaultConnection"],
+        configuration["MYSQL_URL"],
+        configuration["MYSQL_INTERNAL_URL"],
         configuration["DATABASE_URL"],
     };
 
@@ -709,8 +713,65 @@ static string ResolveConnectionString(IConfiguration configuration)
         }
     }
 
+    var host = FirstNonEmpty(
+        configuration["MYSQLHOST"],
+        configuration["MYSQL_HOST"],
+        configuration["DB_HOST"]);
+    var database = FirstNonEmpty(
+        configuration["MYSQLDATABASE"],
+        configuration["MYSQL_DATABASE"],
+        configuration["DB_NAME"]);
+    var user = FirstNonEmpty(
+        configuration["MYSQLUSER"],
+        configuration["MYSQL_USER"],
+        configuration["DB_USER"]);
+    var password = FirstNonEmpty(
+        configuration["MYSQLPASSWORD"],
+        configuration["MYSQL_PASSWORD"],
+        configuration["DB_PASSWORD"]);
+    var portValue = FirstNonEmpty(
+        configuration["MYSQLPORT"],
+        configuration["MYSQL_PORT"],
+        configuration["DB_PORT"]);
+
+    if (!string.IsNullOrWhiteSpace(host))
+    {
+        var connectionStringBuilder = new MySqlConnectionStringBuilder
+        {
+            Server = host,
+            Database = database ?? string.Empty,
+            UserID = user ?? string.Empty,
+            Password = password ?? string.Empty,
+        };
+
+        if (!string.IsNullOrWhiteSpace(portValue))
+        {
+            if (!uint.TryParse(portValue, out var port) || port is < 1)
+            {
+                throw new InvalidOperationException("MYSQLPORT/MYSQL_PORT/DB_PORT must be a valid TCP port number.");
+            }
+
+            connectionStringBuilder.Port = port;
+        }
+
+        return connectionStringBuilder.ConnectionString;
+    }
+
     throw new InvalidOperationException(
-        "Missing connection string. Set ConnectionStrings:DefaultConnection or ConnectionStrings__DefaultConnection, or provide DATABASE_URL in MySQL connection-string or mysql:// form.");
+        "Missing connection string. Set ConnectionStrings:DefaultConnection or ConnectionStrings__DefaultConnection, provide DATABASE_URL/MYSQL_URL/MYSQL_INTERNAL_URL in MySQL connection-string or mysql:// form, or provide split MySQL variables such as MYSQLHOST, MYSQLDATABASE, MYSQLUSER, MYSQLPASSWORD, and MYSQLPORT.");
+}
+
+static string? FirstNonEmpty(params string?[] candidates)
+{
+    foreach (var candidate in candidates)
+    {
+        if (!string.IsNullOrWhiteSpace(candidate))
+        {
+            return candidate;
+        }
+    }
+
+    return null;
 }
 
 static ServerVersion ResolveDatabaseServerVersion(IConfiguration configuration)

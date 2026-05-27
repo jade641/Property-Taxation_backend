@@ -3,17 +3,20 @@ using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using PropertyTax.API.Data;
 
 #nullable disable
 
-namespace PropertyTax.API.Migrations
+namespace PropertyTax.API.Migrations.EF
 {
     [DbContext(typeof(AppDbContext))]
-    partial class AppDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260526130711_AddMlAlertReferenceSupport")]
+    partial class AddMlAlertReferenceSupport
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -506,28 +509,12 @@ namespace PropertyTax.API.Migrations
                     b.Property<string>("CreatedById")
                         .HasColumnType("varchar(255)");
 
-                    b.Property<string>("DatasetName")
-                        .HasMaxLength(255)
-                        .HasColumnType("varchar(255)");
-
-                    b.Property<string>("DatasetStoredAs")
-                        .HasMaxLength(255)
-                        .HasColumnType("varchar(255)");
-
                     b.Property<string>("ExplanationJson")
                         .IsRequired()
                         .HasColumnType("json");
 
-                    b.Property<string>("ExternalPropertyId")
-                        .HasMaxLength(255)
-                        .HasColumnType("varchar(255)");
-
                     b.Property<int>("ModelId")
                         .HasColumnType("int");
-
-                    b.Property<string>("OwnerSnapshot")
-                        .HasMaxLength(255)
-                        .HasColumnType("varchar(255)");
 
                     b.Property<bool>("PredictedLabel")
                         .HasColumnType("tinyint(1)");
@@ -536,18 +523,8 @@ namespace PropertyTax.API.Migrations
                         .HasPrecision(10, 4)
                         .HasColumnType("decimal(10,4)");
 
-                    b.Property<int?>("PropertyId")
+                    b.Property<int>("PropertyId")
                         .HasColumnType("int");
-
-                    b.Property<int?>("RowNumber")
-                        .HasColumnType("int");
-
-                    b.Property<string>("SourceType")
-                        .IsRequired()
-                        .ValueGeneratedOnAdd()
-                        .HasMaxLength(30)
-                        .HasColumnType("varchar(30)")
-                        .HasDefaultValue("Property");
 
                     b.HasKey("Id");
 
@@ -556,10 +533,6 @@ namespace PropertyTax.API.Migrations
                     b.HasIndex("ModelId");
 
                     b.HasIndex("PropertyId");
-
-                    b.HasIndex("SourceType");
-
-                    b.HasIndex("DatasetStoredAs", "ModelId", "RowNumber");
 
                     b.ToTable("ml_predictions", (string)null);
                 });
@@ -1051,7 +1024,8 @@ namespace PropertyTax.API.Migrations
                     b.HasOne("PropertyTax.API.Models.Property", "Property")
                         .WithMany("MlPredictions")
                         .HasForeignKey("PropertyId")
-                        .OnDelete(DeleteBehavior.Cascade);
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
 
                     b.Navigation("CreatedBy");
 

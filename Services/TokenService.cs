@@ -25,6 +25,8 @@ public class TokenService
         var issuer = _configuration["Jwt:Issuer"] ?? "PropertyTax.API";
         var audience = _configuration["Jwt:Audience"] ?? "PropertyTax.Client";
         var secretKey = _configuration["Jwt:Key"]
+            ?? Environment.GetEnvironmentVariable("JWT_KEY")
+            ?? Environment.GetEnvironmentVariable("JWT_SECRET")
             ?? throw new InvalidOperationException("JWT signing key is not configured.");
 
         var claims = new List<Claim>

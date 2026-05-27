@@ -158,9 +158,17 @@ public class AppDbContext : IdentityDbContext<ApplicationUser, IdentityRole, str
             builder.Entity<MlPrediction>(entity =>
             {
                 entity.ToTable("ml_predictions");
+                entity.Property(x => x.SourceType).HasMaxLength(30).HasDefaultValue("Property");
+                entity.Property(x => x.DatasetName).HasMaxLength(255);
+                entity.Property(x => x.DatasetStoredAs).HasMaxLength(255);
+                entity.Property(x => x.ExternalPropertyId).HasMaxLength(255);
+                entity.Property(x => x.OwnerSnapshot).HasMaxLength(255);
                 entity.Property(x => x.ExplanationJson).HasColumnType("json");
                 entity.Property(x => x.CreatedAt).HasColumnType("datetime");
                 entity.Property(x => x.Probability).HasPrecision(10, 4);
+
+                entity.HasIndex(x => x.SourceType);
+                entity.HasIndex(x => new { x.DatasetStoredAs, x.ModelId, x.RowNumber });
 
                 entity.HasOne(x => x.Property)
                         .WithMany(x => x.MlPredictions)
@@ -194,6 +202,7 @@ public class AppDbContext : IdentityDbContext<ApplicationUser, IdentityRole, str
             builder.Entity<MlAlert>(entity =>
             {
                 entity.ToTable("ml_alerts");
+                entity.Property(x => x.ReferenceId).HasMaxLength(255);
                 entity.Property(x => x.Title).HasMaxLength(200);
                 entity.Property(x => x.Severity).HasMaxLength(20);
                 entity.Property(x => x.Status).HasMaxLength(20);
